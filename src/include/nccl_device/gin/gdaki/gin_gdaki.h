@@ -78,6 +78,7 @@ struct ncclGinApi_Put<NCCL_NET_DEVICE_GIN_GDAKI> {
         doca_gpu_dev_verbs_fence_release<DOCA_GPUNETIO_VERBS_SYNC_SCOPE_SYS>();
       }
 
+
       if (hasWins) {
         if (hasSignal && hasCounter) {
           doca_gpu_dev_verbs_put_signal_counter<DOCA_GPUNETIO_VERBS_SIGNAL_OP_ADD>(

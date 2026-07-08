@@ -21,7 +21,11 @@
 #include <poll.h>
 #include <sys/types.h>
 #include <unistd.h>
+#include <atomic>
+#include <map>
 #include <mutex>
+#include <set>
+#include <time.h>
 #define ENABLE_TIMER 0
 #include "timer.h"
 
@@ -127,6 +131,10 @@ NCCL_PARAM(IbPkey, "IB_PKEY", 0);
 NCCL_PARAM(IbUseInline, "IB_USE_INLINE", 0);
 NCCL_PARAM(IbSl, "IB_SL", -1);
 NCCL_PARAM(IbTc, "IB_TC", -1);
+NCCL_PARAM(IbMeasureSend, "IB_MEASURE_SEND", 0);
+NCCL_PARAM(IbMeasureSendLogEvery, "IB_MEASURE_SEND_LOG_EVERY", 1);
+NCCL_PARAM(IbMeasureSendMinBytes, "IB_MEASURE_SEND_MIN_BYTES", 0);
+NCCL_PARAM(IbMeasureSendBucketUs, "IB_MEASURE_SEND_BUCKET_US", 0);
 NCCL_PARAM(IbArThreshold, "IB_AR_THRESHOLD", 8192);
 NCCL_PARAM(IbPciRelaxedOrdering, "IB_PCI_RELAXED_ORDERING", 2);
 NCCL_PARAM(IbAdaptiveRouting, "IB_ADAPTIVE_ROUTING", -2);
@@ -134,6 +142,52 @@ NCCL_PARAM(IbFifoTc, "IB_FIFO_TC", -1);
 NCCL_PARAM(IbAsyncEvents,"IB_RETURN_ASYNC_EVENTS",1);
 NCCL_PARAM(IbEceEnable,"IB_ECE_ENABLE",1);
 NCCL_PARAM(IbDataDirect,"IB_DATA_DIRECT",1);
+
+static std::atomic<uint64_t> ncclIbMeasureSendLogCount{0};
+static std::atomic<uint64_t> ncclIbMeasureSendStartLogCount{0};
+static std::mutex ncclIbMeasureSendBucketMutex;
+static bool ncclIbMeasureSendBucketInitialized = false;
+static uint64_t ncclIbMeasureSendBucketStartNs = 0;
+static uint64_t ncclIbMeasureSendBucketBytes = 0;
+static uint64_t ncclIbMeasureSendBucketSends = 0;
+static uint64_t ncclIbMeasureSendBucketTotalNsSum = 0;
+static uint64_t ncclIbMeasureSendBucketTotalNsMin = 0;
+static uint64_t ncclIbMeasureSendBucketTotalNsMax = 0;
+static uint64_t ncclIbMeasureSendBucketCqWaitNsSum = 0;
+static uint64_t ncclIbMeasureSendBucketCqWaitNsMin = 0;
+static uint64_t ncclIbMeasureSendBucketCqWaitNsMax = 0;
+static uint64_t ncclIbMeasureSendBucketCount = 0;
+static const char* ncclIbMeasureSendBucketPath = NULL;
+
+static std::mutex ncclIbMeasureSendIntervalBucketMutex;
+static bool ncclIbMeasureSendIntervalBucketInitialized = false;
+static uint64_t ncclIbMeasureSendIntervalBucketBaseNs = 0;
+static std::map<uint64_t, double> ncclIbMeasureSendIntervalBucketBytes;
+static std::map<uint64_t, uint64_t> ncclIbMeasureSendIntervalBucketContribs;
+static std::multiset<uint64_t> ncclIbMeasureSendOutstandingPostDoneNs;
+static bool ncclIbMeasureSendIntervalBucketFlushedAny = false;
+static uint64_t ncclIbMeasureSendIntervalBucketLastFlushed = 0;
+static const char* ncclIbMeasureSendIntervalBucketPath = NULL;
+
+static std::mutex ncclIbMeasureSendOutstandingBucketMutex;
+static bool ncclIbMeasureSendOutstandingBucketInitialized = false;
+static uint64_t ncclIbMeasureSendOutstandingBucketBaseNs = 0;
+static uint64_t ncclIbMeasureSendOutstandingBucketLastEventNs = 0;
+static uint64_t ncclIbMeasureSendOutstandingBucketCurrent = 0;
+static std::map<uint64_t, double> ncclIbMeasureSendOutstandingBucketCountNs;
+static std::map<uint64_t, double> ncclIbMeasureSendOutstandingBucketBytes;
+static std::map<uint64_t, uint64_t> ncclIbMeasureSendOutstandingBucketByteContribs;
+static std::map<uint64_t, uint64_t> ncclIbMeasureSendOutstandingBucketMax;
+static std::map<uint64_t, uint64_t> ncclIbMeasureSendOutstandingBucketEvents;
+static bool ncclIbMeasureSendOutstandingBucketFlushedAny = false;
+static uint64_t ncclIbMeasureSendOutstandingBucketLastFlushed = 0;
+static const char* ncclIbMeasureSendOutstandingBucketPath = NULL;
+
+static inline uint64_t ncclIbMeasureSendNowNs() {
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+}
 
 static ncclResult_t ncclIbStatsInit(struct ncclIbStats* stat) {
   __atomic_store_n(&stat->fatalErrorCount, 0, __ATOMIC_RELAXED);
@@ -1071,6 +1125,9 @@ struct ncclIbRequest {
   struct ncclProfilerInfo pInfo[NCCL_NET_IB_MAX_RECVS];
 #endif
   int nreqs;
+  uint64_t measureStartNs;
+  uint64_t measurePostDoneNs;
+  uint64_t measureBytes;
   union {
     struct {
       int size;
@@ -1086,6 +1143,348 @@ struct ncclIbRequest {
     } iput;
   };
 };
+
+static inline void ncclIbMeasureSendStart(struct ncclIbRequest* req, uint64_t bytes) {
+  if (!ncclParamIbMeasureSend()) return;
+  req->measureStartNs = ncclIbMeasureSendNowNs();
+  req->measurePostDoneNs = 0;
+  req->measureBytes = bytes;
+}
+
+static inline bool ncclIbMeasureSendIsTrackedBytes(uint64_t bytes) {
+  int64_t minBytes = ncclParamIbMeasureSendMinBytes();
+  if (minBytes < 0) minBytes = 0;
+  return bytes >= (uint64_t)minBytes;
+}
+
+static inline void ncclIbMeasureSendOutstandingBucketFlushReady(uint64_t bucketNs, uint64_t safeNs) {
+  while (!ncclIbMeasureSendOutstandingBucketCountNs.empty()) {
+    std::map<uint64_t, double>::iterator countIt = ncclIbMeasureSendOutstandingBucketCountNs.begin();
+    uint64_t bucket = countIt->first;
+    uint64_t bucketStartNs = ncclIbMeasureSendOutstandingBucketBaseNs + bucket * bucketNs;
+    if (bucketStartNs + bucketNs > safeNs) break;
+
+    double avgOutstanding = countIt->second / (double)bucketNs;
+    double bytes = ncclIbMeasureSendOutstandingBucketBytes[bucket];
+    double throughputGBps = bytes / (double)bucketNs;
+    uint64_t byteContribs = ncclIbMeasureSendOutstandingBucketByteContribs[bucket];
+    uint64_t maxOutstanding = ncclIbMeasureSendOutstandingBucketMax[bucket];
+    uint64_t events = ncclIbMeasureSendOutstandingBucketEvents[bucket];
+    uint64_t skippedEmptyBuckets = 0;
+    if (ncclIbMeasureSendOutstandingBucketFlushedAny && bucket > ncclIbMeasureSendOutstandingBucketLastFlushed + 1) {
+      skippedEmptyBuckets = bucket - ncclIbMeasureSendOutstandingBucketLastFlushed - 1;
+    }
+    double bucketUs = (double)bucketNs / 1000.0;
+    INFO(NCCL_NET,
+         "NET/IB: send measure outstanding_bucket path=%s bucket=%llu bucket_start_ns=%llu bucket_us=%.3f bytes=%.3f throughput_GBps=%.3f byte_contribs=%llu avg_outstanding=%.3f max_outstanding=%llu events=%llu skipped_empty_buckets=%llu",
+         ncclIbMeasureSendOutstandingBucketPath ? ncclIbMeasureSendOutstandingBucketPath : "unknown",
+         (unsigned long long)bucket, (unsigned long long)bucketStartNs, bucketUs, bytes, throughputGBps,
+         (unsigned long long)byteContribs, avgOutstanding, (unsigned long long)maxOutstanding,
+         (unsigned long long)events, (unsigned long long)skippedEmptyBuckets);
+
+    ncclIbMeasureSendOutstandingBucketFlushedAny = true;
+    ncclIbMeasureSendOutstandingBucketLastFlushed = bucket;
+    ncclIbMeasureSendOutstandingBucketBytes.erase(bucket);
+    ncclIbMeasureSendOutstandingBucketByteContribs.erase(bucket);
+    ncclIbMeasureSendOutstandingBucketMax.erase(bucket);
+    ncclIbMeasureSendOutstandingBucketEvents.erase(bucket);
+    ncclIbMeasureSendOutstandingBucketCountNs.erase(countIt);
+  }
+}
+
+static inline void ncclIbMeasureSendOutstandingBucketAccumulateLocked(uint64_t bucketNs, uint64_t eventNs) {
+  if (!ncclIbMeasureSendOutstandingBucketInitialized) {
+    ncclIbMeasureSendOutstandingBucketInitialized = true;
+    ncclIbMeasureSendOutstandingBucketBaseNs = eventNs;
+    ncclIbMeasureSendOutstandingBucketLastEventNs = eventNs;
+    return;
+  }
+  if (eventNs <= ncclIbMeasureSendOutstandingBucketLastEventNs) return;
+
+  uint64_t intervalStartNs = ncclIbMeasureSendOutstandingBucketLastEventNs;
+  uint64_t intervalEndNs = eventNs;
+  uint64_t firstBucket = (intervalStartNs - ncclIbMeasureSendOutstandingBucketBaseNs) / bucketNs;
+  uint64_t lastBucket = (intervalEndNs - 1 - ncclIbMeasureSendOutstandingBucketBaseNs) / bucketNs;
+  for (uint64_t bucket = firstBucket; bucket <= lastBucket; bucket++) {
+    uint64_t bucketStartNs = ncclIbMeasureSendOutstandingBucketBaseNs + bucket * bucketNs;
+    uint64_t bucketEndNs = bucketStartNs + bucketNs;
+    uint64_t overlapStartNs = intervalStartNs > bucketStartNs ? intervalStartNs : bucketStartNs;
+    uint64_t overlapEndNs = intervalEndNs < bucketEndNs ? intervalEndNs : bucketEndNs;
+    if (overlapEndNs <= overlapStartNs || ncclIbMeasureSendOutstandingBucketCurrent == 0) continue;
+    ncclIbMeasureSendOutstandingBucketCountNs[bucket] +=
+        (double)ncclIbMeasureSendOutstandingBucketCurrent * (double)(overlapEndNs - overlapStartNs);
+    if (ncclIbMeasureSendOutstandingBucketCurrent > ncclIbMeasureSendOutstandingBucketMax[bucket]) {
+      ncclIbMeasureSendOutstandingBucketMax[bucket] = ncclIbMeasureSendOutstandingBucketCurrent;
+    }
+  }
+  ncclIbMeasureSendOutstandingBucketLastEventNs = eventNs;
+}
+
+static inline void ncclIbMeasureSendOutstandingBucketRecordBytesLocked(uint64_t bucketNs, uint64_t intervalStartNs, uint64_t completeNs, uint64_t bytes) {
+  if (!ncclIbMeasureSendOutstandingBucketInitialized || completeNs <= intervalStartNs) return;
+  if (intervalStartNs < ncclIbMeasureSendOutstandingBucketBaseNs) intervalStartNs = ncclIbMeasureSendOutstandingBucketBaseNs;
+  if (completeNs <= intervalStartNs) return;
+
+  uint64_t firstBucket = (intervalStartNs - ncclIbMeasureSendOutstandingBucketBaseNs) / bucketNs;
+  uint64_t lastBucket = (completeNs - 1 - ncclIbMeasureSendOutstandingBucketBaseNs) / bucketNs;
+  uint64_t intervalNs = completeNs - intervalStartNs;
+  for (uint64_t bucket = firstBucket; bucket <= lastBucket; bucket++) {
+    uint64_t bucketStartNs = ncclIbMeasureSendOutstandingBucketBaseNs + bucket * bucketNs;
+    uint64_t bucketEndNs = bucketStartNs + bucketNs;
+    uint64_t overlapStartNs = intervalStartNs > bucketStartNs ? intervalStartNs : bucketStartNs;
+    uint64_t overlapEndNs = completeNs < bucketEndNs ? completeNs : bucketEndNs;
+    if (overlapEndNs <= overlapStartNs) continue;
+    double overlapBytes = (double)bytes * (double)(overlapEndNs - overlapStartNs) / (double)intervalNs;
+    ncclIbMeasureSendOutstandingBucketBytes[bucket] += overlapBytes;
+    ncclIbMeasureSendOutstandingBucketByteContribs[bucket]++;
+  }
+}
+
+static inline void ncclIbMeasureSendOutstandingBucketEvent(const char* path, uint64_t eventNs, int delta, uint64_t intervalStartNs, uint64_t bytes) {
+  int64_t bucketUsParam = ncclParamIbMeasureSendBucketUs();
+  if (bucketUsParam <= 0) return;
+  uint64_t bucketNs = (uint64_t)bucketUsParam * 1000ULL;
+  if (bucketNs == 0) return;
+
+  std::lock_guard<std::mutex> lock(ncclIbMeasureSendOutstandingBucketMutex);
+  if (path != NULL && ncclIbMeasureSendOutstandingBucketPath == NULL) ncclIbMeasureSendOutstandingBucketPath = path;
+  if (ncclIbMeasureSendOutstandingBucketInitialized && eventNs < ncclIbMeasureSendOutstandingBucketBaseNs) {
+    eventNs = ncclIbMeasureSendOutstandingBucketBaseNs;
+  }
+  ncclIbMeasureSendOutstandingBucketAccumulateLocked(bucketNs, eventNs);
+  if (bytes > 0) ncclIbMeasureSendOutstandingBucketRecordBytesLocked(bucketNs, intervalStartNs, eventNs, bytes);
+  if (ncclIbMeasureSendOutstandingBucketInitialized) {
+    uint64_t bucket = (eventNs - ncclIbMeasureSendOutstandingBucketBaseNs) / bucketNs;
+    ncclIbMeasureSendOutstandingBucketEvents[bucket]++;
+  }
+  if (delta > 0) {
+    ncclIbMeasureSendOutstandingBucketCurrent += (uint64_t)delta;
+  } else if (delta < 0) {
+    uint64_t dec = (uint64_t)(-delta);
+    ncclIbMeasureSendOutstandingBucketCurrent = dec > ncclIbMeasureSendOutstandingBucketCurrent ? 0 : ncclIbMeasureSendOutstandingBucketCurrent - dec;
+  }
+  ncclIbMeasureSendOutstandingBucketFlushReady(bucketNs, eventNs);
+}
+
+static inline void ncclIbMeasureSendPostDone(struct ncclIbRequest* req, uint64_t postDoneNs) {
+  if (!ncclParamIbMeasureSend() || req->measureStartNs == 0) return;
+  req->measurePostDoneNs = postDoneNs;
+  if (!ncclIbMeasureSendIsTrackedBytes(req->measureBytes)) return;
+  if (ncclParamIbMeasureSendBucketUs() > 0) {
+    std::lock_guard<std::mutex> lock(ncclIbMeasureSendIntervalBucketMutex);
+    if (!ncclIbMeasureSendIntervalBucketInitialized) {
+      ncclIbMeasureSendIntervalBucketInitialized = true;
+      ncclIbMeasureSendIntervalBucketBaseNs = postDoneNs;
+    }
+    ncclIbMeasureSendOutstandingPostDoneNs.insert(postDoneNs);
+  }
+  ncclIbMeasureSendOutstandingBucketEvent(NULL, postDoneNs, 1, 0, 0);
+}
+
+static inline void ncclIbMeasureSendPostDoneRemove(uint64_t postDoneNs) {
+  if (postDoneNs == 0 || ncclParamIbMeasureSendBucketUs() <= 0) return;
+  std::lock_guard<std::mutex> lock(ncclIbMeasureSendIntervalBucketMutex);
+  std::multiset<uint64_t>::iterator it = ncclIbMeasureSendOutstandingPostDoneNs.find(postDoneNs);
+  if (it != ncclIbMeasureSendOutstandingPostDoneNs.end()) ncclIbMeasureSendOutstandingPostDoneNs.erase(it);
+}
+
+static inline int ncclIbRequestDone(struct ncclIbRequest* req) {
+  return req->events[0] == 0 && req->events[1] == 0 && req->events[2] == 0 && req->events[3] == 0;
+}
+
+static inline void ncclIbMeasureSendLogStart(struct ncclIbRequest** reqs, int nreqs, int slot, int tag) {
+  if (!ncclParamIbMeasureSend()) return;
+  uint64_t sample = ncclIbMeasureSendStartLogCount.fetch_add(1, std::memory_order_relaxed) + 1;
+  if (sample > 16) return;
+
+  uint64_t totalBytes = 0;
+  int validReqs = 0;
+  for (int i = 0; i < nreqs; i++) {
+    if (reqs[i] != NULL) {
+      totalBytes += reqs[i]->measureBytes;
+      validReqs++;
+    }
+  }
+  INFO(NCCL_NET,
+       "NET/IB: send measure start sample=%llu slot=%d tag=%x nreqs=%d validReqs=%d total_bytes=%llu first_bytes=%llu",
+       (unsigned long long)sample, slot, tag, nreqs, validReqs, (unsigned long long)totalBytes,
+       (unsigned long long)((nreqs > 0 && reqs[0] != NULL) ? reqs[0]->measureBytes : 0));
+}
+
+static inline void ncclIbMeasureSendBucketFlush(const char* path, uint64_t bucketNs, uint64_t skippedEmptyBuckets) {
+  if (ncclIbMeasureSendBucketSends == 0) return;
+  double bucketUs = (double)bucketNs / 1000.0;
+  double throughputGBps = bucketNs == 0 ? 0.0 : (double)ncclIbMeasureSendBucketBytes / (double)bucketNs;
+  double totalAvgUs = (double)ncclIbMeasureSendBucketTotalNsSum / (double)ncclIbMeasureSendBucketSends / 1000.0;
+  double cqWaitAvgUs = (double)ncclIbMeasureSendBucketCqWaitNsSum / (double)ncclIbMeasureSendBucketSends / 1000.0;
+  INFO(NCCL_NET,
+       "NET/IB: send measure bucket path=%s bucket=%llu bucket_start_ns=%llu bucket_us=%.3f bytes=%llu sends=%llu throughput_GBps=%.3f total_min_us=%.3f total_avg_us=%.3f total_max_us=%.3f cq_wait_min_us=%.3f cq_wait_avg_us=%.3f cq_wait_max_us=%.3f skipped_empty_buckets=%llu",
+       path ? path : "unknown", (unsigned long long)ncclIbMeasureSendBucketCount,
+       (unsigned long long)ncclIbMeasureSendBucketStartNs, bucketUs,
+       (unsigned long long)ncclIbMeasureSendBucketBytes, (unsigned long long)ncclIbMeasureSendBucketSends, throughputGBps,
+       (double)ncclIbMeasureSendBucketTotalNsMin / 1000.0, totalAvgUs,
+       (double)ncclIbMeasureSendBucketTotalNsMax / 1000.0,
+       (double)ncclIbMeasureSendBucketCqWaitNsMin / 1000.0, cqWaitAvgUs,
+       (double)ncclIbMeasureSendBucketCqWaitNsMax / 1000.0,
+       (unsigned long long)skippedEmptyBuckets);
+}
+
+static inline void ncclIbMeasureSendBucketReset() {
+  ncclIbMeasureSendBucketBytes = 0;
+  ncclIbMeasureSendBucketSends = 0;
+  ncclIbMeasureSendBucketTotalNsSum = 0;
+  ncclIbMeasureSendBucketTotalNsMin = 0;
+  ncclIbMeasureSendBucketTotalNsMax = 0;
+  ncclIbMeasureSendBucketCqWaitNsSum = 0;
+  ncclIbMeasureSendBucketCqWaitNsMin = 0;
+  ncclIbMeasureSendBucketCqWaitNsMax = 0;
+}
+
+static inline void ncclIbMeasureSendBucketRecord(const char* path, uint64_t completeNs, uint64_t bytes, uint64_t totalNs, uint64_t cqWaitNs) {
+  int64_t bucketUsParam = ncclParamIbMeasureSendBucketUs();
+  if (bucketUsParam <= 0) return;
+  uint64_t bucketNs = (uint64_t)bucketUsParam * 1000ULL;
+  if (bucketNs == 0) return;
+
+  std::lock_guard<std::mutex> lock(ncclIbMeasureSendBucketMutex);
+  if (!ncclIbMeasureSendBucketInitialized) {
+    ncclIbMeasureSendBucketInitialized = true;
+    ncclIbMeasureSendBucketStartNs = completeNs;
+    ncclIbMeasureSendBucketPath = path;
+  }
+
+  if (completeNs >= ncclIbMeasureSendBucketStartNs + bucketNs) {
+    uint64_t elapsedBuckets = (completeNs - ncclIbMeasureSendBucketStartNs) / bucketNs;
+    uint64_t skippedEmptyBuckets = elapsedBuckets > 0 ? elapsedBuckets - 1 : 0;
+    ncclIbMeasureSendBucketFlush(ncclIbMeasureSendBucketPath, bucketNs, skippedEmptyBuckets);
+    ncclIbMeasureSendBucketStartNs += elapsedBuckets * bucketNs;
+    ncclIbMeasureSendBucketReset();
+    ncclIbMeasureSendBucketCount += elapsedBuckets;
+    ncclIbMeasureSendBucketPath = path;
+  }
+
+  if (ncclIbMeasureSendBucketSends == 0) {
+    ncclIbMeasureSendBucketTotalNsMin = totalNs;
+    ncclIbMeasureSendBucketTotalNsMax = totalNs;
+    ncclIbMeasureSendBucketCqWaitNsMin = cqWaitNs;
+    ncclIbMeasureSendBucketCqWaitNsMax = cqWaitNs;
+  } else {
+    if (totalNs < ncclIbMeasureSendBucketTotalNsMin) ncclIbMeasureSendBucketTotalNsMin = totalNs;
+    if (totalNs > ncclIbMeasureSendBucketTotalNsMax) ncclIbMeasureSendBucketTotalNsMax = totalNs;
+    if (cqWaitNs < ncclIbMeasureSendBucketCqWaitNsMin) ncclIbMeasureSendBucketCqWaitNsMin = cqWaitNs;
+    if (cqWaitNs > ncclIbMeasureSendBucketCqWaitNsMax) ncclIbMeasureSendBucketCqWaitNsMax = cqWaitNs;
+  }
+  ncclIbMeasureSendBucketBytes += bytes;
+  ncclIbMeasureSendBucketSends++;
+  ncclIbMeasureSendBucketTotalNsSum += totalNs;
+  ncclIbMeasureSendBucketCqWaitNsSum += cqWaitNs;
+}
+
+static inline void ncclIbMeasureSendIntervalBucketFlushReady(uint64_t bucketNs, uint64_t safeNs) {
+  while (!ncclIbMeasureSendIntervalBucketBytes.empty()) {
+    std::map<uint64_t, double>::iterator bytesIt = ncclIbMeasureSendIntervalBucketBytes.begin();
+    uint64_t bucket = bytesIt->first;
+    uint64_t bucketStartNs = ncclIbMeasureSendIntervalBucketBaseNs + bucket * bucketNs;
+    if (bucketStartNs + bucketNs > safeNs) break;
+
+    double bytes = bytesIt->second;
+    uint64_t contribs = ncclIbMeasureSendIntervalBucketContribs[bucket];
+    uint64_t skippedEmptyBuckets = 0;
+    if (ncclIbMeasureSendIntervalBucketFlushedAny && bucket > ncclIbMeasureSendIntervalBucketLastFlushed + 1) {
+      skippedEmptyBuckets = bucket - ncclIbMeasureSendIntervalBucketLastFlushed - 1;
+    }
+    double bucketUs = (double)bucketNs / 1000.0;
+    double throughputGBps = bucketNs == 0 ? 0.0 : bytes / (double)bucketNs;
+    INFO(NCCL_NET,
+         "NET/IB: send measure interval_bucket path=%s bucket=%llu bucket_start_ns=%llu bucket_us=%.3f bytes=%.3f contributions=%llu throughput_GBps=%.3f skipped_empty_buckets=%llu",
+         ncclIbMeasureSendIntervalBucketPath ? ncclIbMeasureSendIntervalBucketPath : "unknown",
+         (unsigned long long)bucket, (unsigned long long)bucketStartNs, bucketUs, bytes,
+         (unsigned long long)contribs, throughputGBps, (unsigned long long)skippedEmptyBuckets);
+
+    ncclIbMeasureSendIntervalBucketFlushedAny = true;
+    ncclIbMeasureSendIntervalBucketLastFlushed = bucket;
+    ncclIbMeasureSendIntervalBucketContribs.erase(bucket);
+    ncclIbMeasureSendIntervalBucketBytes.erase(bytesIt);
+  }
+}
+
+static inline void ncclIbMeasureSendIntervalBucketRecord(const char* path, uint64_t intervalStartNs, uint64_t completeNs, uint64_t bytes) {
+  int64_t bucketUsParam = ncclParamIbMeasureSendBucketUs();
+  if (bucketUsParam <= 0 || completeNs <= intervalStartNs) return;
+  uint64_t bucketNs = (uint64_t)bucketUsParam * 1000ULL;
+  if (bucketNs == 0) return;
+
+  std::lock_guard<std::mutex> lock(ncclIbMeasureSendIntervalBucketMutex);
+  if (!ncclIbMeasureSendIntervalBucketInitialized) {
+    ncclIbMeasureSendIntervalBucketInitialized = true;
+    ncclIbMeasureSendIntervalBucketBaseNs = intervalStartNs;
+  }
+  if (ncclIbMeasureSendIntervalBucketPath == NULL) ncclIbMeasureSendIntervalBucketPath = path;
+  if (intervalStartNs < ncclIbMeasureSendIntervalBucketBaseNs) intervalStartNs = ncclIbMeasureSendIntervalBucketBaseNs;
+
+  uint64_t firstBucket = (intervalStartNs - ncclIbMeasureSendIntervalBucketBaseNs) / bucketNs;
+  uint64_t lastBucket = (completeNs - 1 - ncclIbMeasureSendIntervalBucketBaseNs) / bucketNs;
+  uint64_t intervalNs = completeNs - intervalStartNs;
+  for (uint64_t bucket = firstBucket; bucket <= lastBucket; bucket++) {
+    uint64_t bucketStartNs = ncclIbMeasureSendIntervalBucketBaseNs + bucket * bucketNs;
+    uint64_t bucketEndNs = bucketStartNs + bucketNs;
+    uint64_t overlapStartNs = intervalStartNs > bucketStartNs ? intervalStartNs : bucketStartNs;
+    uint64_t overlapEndNs = completeNs < bucketEndNs ? completeNs : bucketEndNs;
+    if (overlapEndNs <= overlapStartNs) continue;
+    double overlapBytes = (double)bytes * (double)(overlapEndNs - overlapStartNs) / (double)intervalNs;
+    ncclIbMeasureSendIntervalBucketBytes[bucket] += overlapBytes;
+    ncclIbMeasureSendIntervalBucketContribs[bucket]++;
+  }
+
+  uint64_t safeNs = ncclIbMeasureSendOutstandingPostDoneNs.empty() ? completeNs : *ncclIbMeasureSendOutstandingPostDoneNs.begin();
+  ncclIbMeasureSendIntervalBucketFlushReady(bucketNs, safeNs);
+}
+
+static inline void ncclIbMeasureSendIntervalBucketFlushSafe(uint64_t completeNs) {
+  int64_t bucketUsParam = ncclParamIbMeasureSendBucketUs();
+  if (bucketUsParam <= 0) return;
+  uint64_t bucketNs = (uint64_t)bucketUsParam * 1000ULL;
+  if (bucketNs == 0) return;
+
+  std::lock_guard<std::mutex> lock(ncclIbMeasureSendIntervalBucketMutex);
+  uint64_t safeNs = ncclIbMeasureSendOutstandingPostDoneNs.empty() ? completeNs : *ncclIbMeasureSendOutstandingPostDoneNs.begin();
+  ncclIbMeasureSendIntervalBucketFlushReady(bucketNs, safeNs);
+}
+
+static inline void ncclIbMeasureSendComplete(struct ncclIbRequest* req, const char* path) {
+  if (!ncclParamIbMeasureSend() || req->measureStartNs == 0) return;
+  uint64_t bytes = req->measureBytes;
+  uint64_t completeNs = ncclIbMeasureSendNowNs();
+  uint64_t startNs = req->measureStartNs;
+  uint64_t postDoneNs = req->measurePostDoneNs;
+  uint64_t totalNs = completeNs - startNs;
+  uint64_t postNs = postDoneNs == 0 ? 0 : postDoneNs - startNs;
+  uint64_t cqWaitNs = postDoneNs == 0 ? 0 : completeNs - postDoneNs;
+  req->measureStartNs = 0;
+  req->measurePostDoneNs = 0;
+  if (!ncclIbMeasureSendIsTrackedBytes(bytes)) return;
+
+  ncclIbMeasureSendBucketRecord(path, completeNs, bytes, totalNs, cqWaitNs);
+  ncclIbMeasureSendIntervalBucketRecord(path, postDoneNs == 0 ? startNs : postDoneNs, completeNs, bytes);
+  ncclIbMeasureSendOutstandingBucketEvent(path, completeNs, -1, postDoneNs == 0 ? startNs : postDoneNs, bytes);
+  ncclIbMeasureSendPostDoneRemove(postDoneNs);
+  ncclIbMeasureSendIntervalBucketFlushSafe(completeNs);
+
+  int64_t logEvery = ncclParamIbMeasureSendLogEvery();
+  if (logEvery <= 0) logEvery = 1;
+  uint64_t sample = ncclIbMeasureSendLogCount.fetch_add(1, std::memory_order_relaxed) + 1;
+  if ((sample % (uint64_t)logEvery) != 0) return;
+
+  double totalUs = (double)totalNs / 1000.0;
+  double postUs = (double)postNs / 1000.0;
+  double cqWaitUs = (double)cqWaitNs / 1000.0;
+  double throughputGBps = totalNs == 0 ? 0.0 : (double)bytes / (double)totalNs;
+  double cqThroughputGBps = cqWaitNs == 0 ? 0.0 : (double)bytes / (double)cqWaitNs;
+  INFO(NCCL_NET,
+       "NET/IB: send measure path=%s sample=%llu req=%p comm=%p type=%s bytes=%llu total_us=%.3f post_us=%.3f cq_wait_us=%.3f throughput_GBps=%.3f cq_throughput_GBps=%.3f nreqs=%d",
+       path, (unsigned long long)sample, req, req->base, reqTypeStr[req->type], (unsigned long long)bytes, totalUs,
+       postUs, cqWaitUs, throughputGBps, cqThroughputGBps, req->nreqs);
+}
 
 struct ncclIbNetCommDevBase {
   int ibDevN;
@@ -2119,6 +2518,9 @@ ncclResult_t ncclIbMultiSend(struct ncclIbSendComm* comm, int slot) {
   // Multi-QP: make sure IB writes are multiples of 128B so that LL and LL128 protocols still work
   const int align = 128;
   int nqps = ncclParamIbSplitDataOnQps() ? comm->base.nqps : comm->base.nDataQps;
+  uint64_t measurePostStartNs = 0;
+  uint64_t measurePostDoneNs = 0;
+  bool measureSend = ncclParamIbMeasureSend();
   for (int i = 0; i < nqps; i++) {
     int qpIndex = comm->base.qpIndex;
     ncclIbQp* qp = comm->base.qps + qpIndex;
@@ -2171,7 +2573,18 @@ ncclResult_t ncclIbMultiSend(struct ncclIbSendComm* comm, int slot) {
       reqs[r]->pInfo[0].nEventHandles++;
     }
 #endif
+    if (measureSend) {
+      uint64_t postStartNs = ncclIbMeasureSendNowNs();
+      if (measurePostStartNs == 0) {
+        measurePostStartNs = postStartNs;
+        for (int r=0; r<nreqs; r++) {
+          reqs[r]->measureStartNs = measurePostStartNs;
+          reqs[r]->measurePostDoneNs = 0;
+        }
+      }
+    }
     NCCLCHECK(wrap_ibv_post_send(qp->qp, comm->wrs, &bad_wr));
+    if (measureSend) measurePostDoneNs = ncclIbMeasureSendNowNs();
 
     for (int r=0; r<nreqs; r++) {
       int chunkSize = DIVUP(DIVUP(reqs[r]->send.size, nqps), align) * align;
@@ -2182,6 +2595,12 @@ ncclResult_t ncclIbMultiSend(struct ncclIbSendComm* comm, int slot) {
 
     // Select the next qpIndex
     comm->base.qpIndex = (comm->base.qpIndex+1) % comm->base.nqps;
+  }
+
+  if (measureSend && measurePostDoneNs != 0) {
+    for (int r=0; r<nreqs; r++) {
+      ncclIbMeasureSendPostDone(reqs[r], measurePostDoneNs);
+    }
   }
 
   return ncclSuccess;
@@ -2233,6 +2652,9 @@ ncclResult_t ncclIbIsend(void* sendComm, void* data, size_t size, int tag, void*
     req->nreqs = nreqs;
     req->send.size = size;
     req->send.data = data;
+    req->measureStartNs = 0;
+    req->measurePostDoneNs = 0;
+    req->measureBytes = 0;
     req->send.offset = 0;
 #ifdef NCCL_ENABLE_NET_PROFILING
     req->pInfo[0].pHandle = phandle;
@@ -2263,6 +2685,17 @@ ncclResult_t ncclIbIsend(void* sendComm, void* data, size_t size, int tag, void*
     // If this is a multi-recv, send only when all requests have matched.
     for (int r=0; r<nreqs; r++) {
       if (reqs[r] == NULL) return ncclSuccess;
+    }
+
+    if (ncclParamIbMeasureSend()) {
+      for (int i = 0; i < nreqs; i++) {
+        if (reqs[i] != NULL) {
+          reqs[i]->measureStartNs = 0;
+          reqs[i]->measurePostDoneNs = 0;
+          reqs[i]->measureBytes = reqs[i]->send.size;
+        }
+      }
+      ncclIbMeasureSendLogStart(reqs, nreqs, slot, tag);
     }
 
     TIME_START(0);
@@ -2481,7 +2914,7 @@ ncclResult_t ncclIbTest(void* request, int* done, int* sizes) {
   *done = 0;
   while (1) {
     NCCLCHECK(ncclIbStatsCheckFatalCount(&r->base->stats,__func__));
-    if (r->events[0] == 0 && r->events[1] == 0 && r->events[2] == 0 && r->events[3] == 0) {
+    if (ncclIbRequestDone(r)) {
       TRACE(NCCL_NET, "r=%p done", r);
       *done = 1;
       if (sizes && r->type == NCCL_NET_IB_REQ_RECV) {
@@ -2494,6 +2927,7 @@ ncclResult_t ncclIbTest(void* request, int* done, int* sizes) {
 #endif
         }
       }
+      if (r->type == NCCL_NET_IB_REQ_SEND) ncclIbMeasureSendComplete(r, "isend");
       if (sizes && r->type == NCCL_NET_IB_REQ_SEND) {
         sizes[0] = r->send.size;
 #ifdef NCCL_ENABLE_NET_PROFILING
@@ -2564,6 +2998,7 @@ ncclResult_t ncclIbTest(void* request, int* done, int* sizes) {
                 return ncclInternalError;
               }
               sendReq->events[i]--;
+              if (ncclIbRequestDone(sendReq)) ncclIbMeasureSendComplete(sendReq, "cq-isend");
 #ifdef NCCL_ENABLE_NET_PROFILING
               // Stop Qp event for sendReq
               int qpIndex = getReqQpIndex(sendReq, j, wc->qp_num);
@@ -3043,7 +3478,12 @@ ncclResult_t ncclGinIbProxyIPut(void *collComm, uint64_t srcOff, void *srcMhandl
   NCCLCHECK(ncclIbGetRequest(&comm->base, &req));
   req->type = NCCL_NET_IB_REQ_GIN_IPUT;
   req->sock = &comm->base.sock;
+  req->base = &comm->base;
+  req->nreqs = 1;
   req->iput.rank = rank;
+  req->measureStartNs = 0;
+  req->measurePostDoneNs = 0;
+  req->measureBytes = 0;
   for (int i = 0; i < comm->base.vProps.ndevs; i++) {
     req->devBases[i] = &comm->devs[i].base;
   }
@@ -3066,8 +3506,10 @@ ncclResult_t ncclGinIbProxyIPut(void *collComm, uint64_t srcOff, void *srcMhandl
   sge.length = size;  // Size of the transfer
   sge.lkey = lkey;  // Local key
 
+  ncclIbMeasureSendStart(req, size);
   struct ibv_send_wr* bad_wr;
   NCCLCHECK(wrap_ibv_post_send(qp->qp, &wr, &bad_wr));
+  ncclIbMeasureSendPostDone(req, ncclIbMeasureSendNowNs());
   ncclIbAddEvent(req, qp->devIndex, &comm->devs[qp->devIndex].base);
 
   *request = req;
@@ -3098,7 +3540,12 @@ ncclResult_t ncclGinIbProxyIPutSignal(void *collComm, uint64_t srcOff, void *src
   NCCLCHECK(ncclIbGetRequest(&comm->base, &req));
   req->type = NCCL_NET_IB_REQ_GIN_IPUT;
   req->sock = &comm->base.sock;
+  req->base = &comm->base;
+  req->nreqs = 1;
   req->iput.rank = rank;
+  req->measureStartNs = 0;
+  req->measurePostDoneNs = 0;
+  req->measureBytes = 0;
   for (int i = 0; i < comm->base.vProps.ndevs; i++) {
     req->devBases[i] = &comm->devs[i].base;
   }
@@ -3149,8 +3596,10 @@ ncclResult_t ncclGinIbProxyIPutSignal(void *collComm, uint64_t srcOff, void *src
   sge[1].lkey = comm->devs[devIndex].putSignalScratchpadMr->lkey;
 
   // Send the put and the signal in one go
+  ncclIbMeasureSendStart(req, size);
   struct ibv_send_wr* bad_wr;
   NCCLCHECK(wrap_ibv_post_send(qp->qp, size > 0 ? &wr[0] : &wr[1], &bad_wr));
+  ncclIbMeasureSendPostDone(req, ncclIbMeasureSendNowNs());
   ncclIbAddEvent(req, qp->devIndex, &comm->devs[qp->devIndex].base);
   *request = req;
   return ncclSuccess;
@@ -3164,6 +3613,7 @@ ncclResult_t ncclGinIbProxyTest(void *collComm, void *request, int *done) {
 
   if (req->events[0] == 0) {
     *done = 1;
+    ncclIbMeasureSendComplete(req, "gin_iput");
     NCCLCHECK(ncclIbFreeRequest(req));
     return ncclSuccess;
   }
@@ -3197,6 +3647,7 @@ ncclResult_t ncclGinIbProxyTest(void *collComm, void *request, int *done) {
     wcReq->events[0]--;
     if (wcReq == req && wcReq->events[0] == 0) {
       *done = 1;
+      ncclIbMeasureSendComplete(wcReq, "gin_iput");
       NCCLCHECK(ncclIbFreeRequest(wcReq));
     }
   }
