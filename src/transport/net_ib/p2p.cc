@@ -10,6 +10,11 @@
 #include "compiler.h"
 #include "p2p_resiliency.h"
 
+#include <atomic>
+#include <time.h>
+
+NCCL_PARAM(IbMeasureSend, "IB_MEASURE_SEND", 0);
+NCCL_PARAM(IbMeasureSendLogEvery, "IB_MEASURE_SEND_LOG_EVERY", 1);
 NCCL_PARAM(IbArThreshold, "IB_AR_THRESHOLD", -2);
 int64_t ncclIbArThreshold = 8192;
 
@@ -17,6 +22,14 @@ int64_t ncclIbArThreshold = 8192;
 NCCL_PARAM(IbReceiverSideMatchingScheme, "IB_RECEIVER_SIDE_MATCHING_SCHEME", -2);
 
 const char* ncclIbReqTypeStr[] = {"Unused", "Send", "Recv", "Flush", "IPut"};
+
+static std::atomic<uint64_t> ncclIbMeasureSendLogCount{0};
+
+static inline uint64_t ncclIbMeasureSendNowNs() {
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+}
 
 ncclResult_t ncclIbGetRequest(struct ncclIbNetCommBase* base, struct ncclIbRequest** req) {
   for (int i = 0; i < NET_IB_MAX_REQUESTS; i++) {
@@ -312,6 +325,8 @@ ncclResult_t ncclIbIsend(void* sendComm, void* data, size_t size, int tag, void*
     req->nreqs = nreqs;
     req->send.size = size;
     req->send.data = data;
+    req->send.measureStartNs = 0;
+    req->send.measureBytes = 0;
     if (comm->base.resiliency) {
       memset(req->send.sentData, 0, sizeof(req->send.sentData));
     }
@@ -348,6 +363,16 @@ ncclResult_t ncclIbIsend(void* sendComm, void* data, size_t size, int tag, void*
     comm->sendReqsCnt[slot]++;
     // If this is a multi-recv, send only when all requests have matched.
     if (comm->sendReqsCnt[slot] < nreqs) return ncclSuccess;
+
+    if (ncclParamIbMeasureSend()) {
+      uint64_t measureStartNs = ncclIbMeasureSendNowNs();
+      for (int i = 0; i < nreqs; i++) {
+        if (reqs[i] != NULL) {
+          reqs[i]->send.measureStartNs = measureStartNs;
+          reqs[i]->send.measureBytes = reqs[i]->send.size;
+        }
+      }
+    }
 
     TIME_START(0);
     NCCLCHECK(ncclIbMultiSend(comm, slot));
@@ -646,6 +671,22 @@ static inline ncclResult_t ncclIbRequestComplete(struct ncclIbRequest* r, int* d
   }
   if (r->type == NCCL_NET_IB_REQ_SEND) {
     TRACE(NCCL_NET, "NET/IB: %s: Send request completed (req=%p, comm=%p, id=%ld)", __func__, r, r->base, r->id);
+    if (ncclParamIbMeasureSend() && r->send.measureStartNs != 0) {
+      uint64_t elapsedNs = ncclIbMeasureSendNowNs() - r->send.measureStartNs;
+      uint64_t bytes = r->send.measureBytes;
+      int64_t logEvery = ncclParamIbMeasureSendLogEvery();
+      if (logEvery <= 0) logEvery = 1;
+      uint64_t sample = ncclIbMeasureSendLogCount.fetch_add(1, std::memory_order_relaxed) + 1;
+      if ((sample % (uint64_t)logEvery) == 0) {
+        double timeUs = (double)elapsedNs / 1000.0;
+        double throughputGBps = elapsedNs == 0 ? 0.0 : (double)bytes / (double)elapsedNs;
+        INFO(NCCL_NET,
+             "NET/IB: send measure sample=%llu req=%p comm=%p id=%llu bytes=%llu time_us=%.3f throughput_GBps=%.3f nreqs=%d",
+             (unsigned long long)sample, r, r->base, (unsigned long long)r->id, (unsigned long long)bytes, timeUs,
+             throughputGBps, r->nreqs);
+      }
+      r->send.measureStartNs = 0;
+    }
     if (sizes) {
       sizes[0] = r->send.size;
 #ifdef NCCL_ENABLE_NET_PROFILING
