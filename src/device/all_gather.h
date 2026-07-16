@@ -50,16 +50,22 @@ namespace {
         offset = dataOffset + rankDest * count;
 
         if ((inputBuf + dataOffset == outputBuf + offset) || isNetOffload) { // In place or onePPN
+          unsigned long long primStart = NCCL_RING_PRIM_MEASURE_START(tid);
           prims.directSend(dataOffset, offset, nelem);
+          NCCL_RING_PRIM_MEASURE_END(tid, "AllGather", "directSend", elemOffset, chunkCount, nelem, sizeof(T), primStart);
         } else {
+          unsigned long long primStart = NCCL_RING_PRIM_MEASURE_START(tid);
           prims.directCopySend(dataOffset, offset, nelem);
+          NCCL_RING_PRIM_MEASURE_END(tid, "AllGather", "directCopySend", elemOffset, chunkCount, nelem, sizeof(T), primStart);
         }
 
         // k-2 steps: copy to next GPU
         for (int j = 1; j < nranks - 1; ++j) {
           rankDest = ringRanks[nranks - j];
           offset = dataOffset + rankDest * count;
+          unsigned long long primStart = NCCL_RING_PRIM_MEASURE_START(tid);
           prims.directRecvCopyDirectSend(offset, offset, nelem);
+          NCCL_RING_PRIM_MEASURE_END(tid, "AllGather", "directRecvCopyDirectSend", elemOffset, chunkCount, nelem, sizeof(T), primStart);
         }
 
         // Make final copy from buffer to dest.
@@ -67,13 +73,17 @@ namespace {
         offset = dataOffset + rankDest * count;
 
         // Final wait/copy.
+        unsigned long long primStart = NCCL_RING_PRIM_MEASURE_START(tid);
         prims.directRecv(offset, nelem);
+        NCCL_RING_PRIM_MEASURE_END(tid, "AllGather", "directRecv", elemOffset, chunkCount, nelem, sizeof(T), primStart);
       }
     } else if (inputBuf != outputBuf + ringRanks[0] * count) {
       inputBuf = inputBuf + partOffset;
       outputBuf = outputBuf + partOffset + ringRanks[0] * count;
+      unsigned long long primStart = NCCL_RING_PRIM_MEASURE_START(tid - workNthreads);
       reduceCopy<COLL_UNROLL, RedOp, T, 0, 1, 1, 0, 1, 1, /*PreOpSrcs=*/0>
         (tid - workNthreads, nthreads - workNthreads, work->redOpArg, &work->redOpArg, false, 1, (void**)&inputBuf, 1, (void**)&outputBuf, partCount);
+      NCCL_RING_PRIM_MEASURE_END(tid - workNthreads, "AllGather", "localReduceCopy", 0, partCount, partCount, sizeof(T), primStart);
     }
     // we have to wait for all warps before we can proceed to the next work;
     // otherwise, we can have contention if next work will use the outputBuf

@@ -38,19 +38,31 @@ namespace {
       // step 0: push data to next GPU
       rankDest = ringRanks[nranks-1];
       offset = dataOffset + rankDest * count;
-      prims.send(offset, nelem);
+      {
+        unsigned long long primStart = NCCL_RING_PRIM_MEASURE_START(tid);
+        prims.send(offset, nelem);
+        NCCL_RING_PRIM_MEASURE_END(tid, "ReduceScatter", "send", elemOffset, chunkCount, nelem, sizeof(T), primStart);
+      }
 
       // k-2 steps: reduce and copy to next GPU
       for (int j=2; j<nranks; ++j) {
         rankDest = ringRanks[nranks-j];
         offset = dataOffset + rankDest * count;
-        prims.recvReduceSend(offset, nelem);
+        {
+          unsigned long long primStart = NCCL_RING_PRIM_MEASURE_START(tid);
+          prims.recvReduceSend(offset, nelem);
+          NCCL_RING_PRIM_MEASURE_END(tid, "ReduceScatter", "recvReduceSend", elemOffset, chunkCount, nelem, sizeof(T), primStart);
+        }
       }
 
       // step k-1: reduce this buffer and data, which will produce the final result
       rankDest = ringRanks[0];
       offset = dataOffset + rankDest * count;
-      prims.recvReduceCopy(offset, dataOffset, nelem, /*postOp=*/true);
+      {
+        unsigned long long primStart = NCCL_RING_PRIM_MEASURE_START(tid);
+        prims.recvReduceCopy(offset, dataOffset, nelem, /*postOp=*/true);
+        NCCL_RING_PRIM_MEASURE_END(tid, "ReduceScatter", "recvReduceCopy", elemOffset, chunkCount, nelem, sizeof(T), primStart);
+      }
     }
   }
 }

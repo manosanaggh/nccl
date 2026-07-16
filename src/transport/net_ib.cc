@@ -12,6 +12,7 @@
 #include "utils.h"
 #include "param.h"
 #include "profiler/net_ib.h"
+#include "nvtx.h"
 
 #include <assert.h>
 #include <pthread.h>
@@ -135,6 +136,7 @@ NCCL_PARAM(IbMeasureSend, "IB_MEASURE_SEND", 0);
 NCCL_PARAM(IbMeasureSendLogEvery, "IB_MEASURE_SEND_LOG_EVERY", 1);
 NCCL_PARAM(IbMeasureSendMinBytes, "IB_MEASURE_SEND_MIN_BYTES", 0);
 NCCL_PARAM(IbMeasureSendBucketUs, "IB_MEASURE_SEND_BUCKET_US", 0);
+NCCL_PARAM(IbMeasureSendIdleNvtx, "IB_MEASURE_SEND_IDLE_NVTX", 0);
 NCCL_PARAM(IbArThreshold, "IB_AR_THRESHOLD", 8192);
 NCCL_PARAM(IbPciRelaxedOrdering, "IB_PCI_RELAXED_ORDERING", 2);
 NCCL_PARAM(IbAdaptiveRouting, "IB_ADAPTIVE_ROUTING", -2);
@@ -182,6 +184,13 @@ static std::map<uint64_t, uint64_t> ncclIbMeasureSendOutstandingBucketEvents;
 static bool ncclIbMeasureSendOutstandingBucketFlushedAny = false;
 static uint64_t ncclIbMeasureSendOutstandingBucketLastFlushed = 0;
 static const char* ncclIbMeasureSendOutstandingBucketPath = NULL;
+
+static std::mutex ncclIbMeasureSendIdleMutex;
+static uint64_t ncclIbMeasureSendIdleOutstanding = 0;
+static uint64_t ncclIbMeasureSendIdleStartNs = 0;
+static const char* ncclIbMeasureSendIdlePath = NULL;
+static uint64_t ncclIbMeasureSendIdleCount = 0;
+static nvtxRangeId_t ncclIbMeasureSendIdleNvtxRange = 0;
 
 static inline uint64_t ncclIbMeasureSendNowNs() {
   struct timespec ts;
@@ -1240,6 +1249,25 @@ static inline void ncclIbMeasureSendOutstandingBucketRecordBytesLocked(uint64_t 
   }
 }
 
+static inline nvtxRangeId_t ncclIbMeasureSendIdleNvtxStart() {
+  if (ncclParamNvtxDisable() || !ncclParamIbMeasureSendIdleNvtx()) return 0;
+  nvtxEventAttributes_t eventAttrib = {0};
+  eventAttrib.version = NVTX_VERSION;
+  eventAttrib.size = NVTX_EVENT_ATTRIB_STRUCT_SIZE;
+  eventAttrib.colorType = NVTX_COLOR_ARGB;
+  eventAttrib.color = 0xffff6b00;
+  eventAttrib.messageType = NVTX_MESSAGE_TYPE_ASCII;
+  eventAttrib.message.ascii = "NCCL_NET_IB_OUTSTANDING_SENDS_0";
+  return nvtxDomainRangeStartEx(nvtx3::domain::get<nccl_domain>(), &eventAttrib);
+}
+
+static inline void ncclIbMeasureSendIdleNvtxEnd() {
+  if (ncclIbMeasureSendIdleNvtxRange != 0) {
+    nvtxDomainRangeEnd(nvtx3::domain::get<nccl_domain>(), ncclIbMeasureSendIdleNvtxRange);
+    ncclIbMeasureSendIdleNvtxRange = 0;
+  }
+}
+
 static inline void ncclIbMeasureSendOutstandingBucketEvent(const char* path, uint64_t eventNs, int delta, uint64_t intervalStartNs, uint64_t bytes) {
   int64_t bucketUsParam = ncclParamIbMeasureSendBucketUs();
   if (bucketUsParam <= 0) return;
@@ -1266,10 +1294,40 @@ static inline void ncclIbMeasureSendOutstandingBucketEvent(const char* path, uin
   ncclIbMeasureSendOutstandingBucketFlushReady(bucketNs, eventNs);
 }
 
+static inline void ncclIbMeasureSendIdleEvent(const char* path, uint64_t eventNs, int delta) {
+  std::lock_guard<std::mutex> lock(ncclIbMeasureSendIdleMutex);
+  if (delta > 0) {
+    if (ncclIbMeasureSendIdleOutstanding == 0 && ncclIbMeasureSendIdleStartNs != 0) {
+      if (eventNs < ncclIbMeasureSendIdleStartNs) eventNs = ncclIbMeasureSendIdleStartNs;
+      uint64_t idleNs = eventNs - ncclIbMeasureSendIdleStartNs;
+      uint64_t sample = ++ncclIbMeasureSendIdleCount;
+      const char* idlePath = path ? path : ncclIbMeasureSendIdlePath;
+      INFO(NCCL_NET,
+           "NET/IB: send measure idle path=%s sample=%llu idle_start_ns=%llu idle_end_ns=%llu idle_us=%.3f",
+           idlePath ? idlePath : "unknown", (unsigned long long)sample,
+           (unsigned long long)ncclIbMeasureSendIdleStartNs, (unsigned long long)eventNs,
+           (double)idleNs / 1000.0);
+      ncclIbMeasureSendIdleNvtxEnd();
+      ncclIbMeasureSendIdleStartNs = 0;
+      ncclIbMeasureSendIdlePath = NULL;
+    }
+    ncclIbMeasureSendIdleOutstanding += (uint64_t)delta;
+  } else if (delta < 0) {
+    uint64_t dec = (uint64_t)(-delta);
+    ncclIbMeasureSendIdleOutstanding = dec > ncclIbMeasureSendIdleOutstanding ? 0 : ncclIbMeasureSendIdleOutstanding - dec;
+    if (ncclIbMeasureSendIdleOutstanding == 0) {
+      ncclIbMeasureSendIdleStartNs = eventNs;
+      ncclIbMeasureSendIdlePath = path;
+      if (ncclIbMeasureSendIdleNvtxRange == 0) ncclIbMeasureSendIdleNvtxRange = ncclIbMeasureSendIdleNvtxStart();
+    }
+  }
+}
+
 static inline void ncclIbMeasureSendPostDone(struct ncclIbRequest* req, uint64_t postDoneNs) {
   if (!ncclParamIbMeasureSend() || req->measureStartNs == 0) return;
   req->measurePostDoneNs = postDoneNs;
   if (!ncclIbMeasureSendIsTrackedBytes(req->measureBytes)) return;
+  ncclIbMeasureSendIdleEvent(NULL, postDoneNs, 1);
   if (ncclParamIbMeasureSendBucketUs() > 0) {
     std::lock_guard<std::mutex> lock(ncclIbMeasureSendIntervalBucketMutex);
     if (!ncclIbMeasureSendIntervalBucketInitialized) {
@@ -1464,6 +1522,7 @@ static inline void ncclIbMeasureSendComplete(struct ncclIbRequest* req, const ch
   req->measurePostDoneNs = 0;
   if (!ncclIbMeasureSendIsTrackedBytes(bytes)) return;
 
+  ncclIbMeasureSendIdleEvent(path, completeNs, -1);
   ncclIbMeasureSendBucketRecord(path, completeNs, bytes, totalNs, cqWaitNs);
   ncclIbMeasureSendIntervalBucketRecord(path, postDoneNs == 0 ? startNs : postDoneNs, completeNs, bytes);
   ncclIbMeasureSendOutstandingBucketEvent(path, completeNs, -1, postDoneNs == 0 ? startNs : postDoneNs, bytes);

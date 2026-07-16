@@ -14,6 +14,33 @@
 
 #define NCCL_SPINS_BEFORE_CHECK_ABORT 10000
 
+#ifndef NCCL_DEVICE_MEASURE_RING_PRIMS
+#define NCCL_DEVICE_MEASURE_RING_PRIMS 1
+#endif
+
+#if NCCL_DEVICE_MEASURE_RING_PRIMS
+#define NCCL_RING_PRIM_MEASURE_START(_tid) \
+  (((_tid) == 0 && ncclShmem.comm.measureRingPrims) ? globaltimer() : 0ULL)
+#define NCCL_RING_PRIM_MEASURE_END(_tid, _coll, _prim, _elemOffset, _chunkCount, _nelem, _typeSize, _start) do { \
+  if ((_tid) == 0 && ncclShmem.comm.measureRingPrims) { \
+    unsigned long long __ncclRingPrimBytes = (unsigned long long)(_nelem) * (unsigned long long)(_typeSize); \
+    unsigned long long __ncclRingPrimChunk = ((unsigned long long)(_chunkCount) == 0ULL) ? 0ULL : \
+      ((unsigned long long)(_elemOffset) / (unsigned long long)(_chunkCount)); \
+    unsigned long long __ncclRingPrimLogEvery = ncclShmem.comm.measureRingPrimsLogEvery; \
+    if (__ncclRingPrimBytes >= ncclShmem.comm.measureRingPrimsMinBytes && \
+        (__ncclRingPrimLogEvery <= 1ULL || (__ncclRingPrimChunk % __ncclRingPrimLogEvery) == 0ULL)) { \
+      unsigned long long __ncclRingPrimEnd = globaltimer(); \
+      printf("NCCL INFO RING_PRIM measure coll=%s prim=%s rank=%d channel=%d block=%d chunk=%llu elemOffset=%llu nelem=%lld bytes=%llu time_ns=%llu\n", \
+          _coll, _prim, ncclShmem.comm.rank, ncclShmem.channelId, blockIdx.x, __ncclRingPrimChunk, \
+          (unsigned long long)(_elemOffset), (long long)(_nelem), __ncclRingPrimBytes, \
+          __ncclRingPrimEnd - (unsigned long long)(_start)); \
+    } \
+  } \
+} while (0)
+#else
+#define NCCL_RING_PRIM_MEASURE_START(_tid) 0ULL
+#define NCCL_RING_PRIM_MEASURE_END(_tid, _coll, _prim, _elemOffset, _chunkCount, _nelem, _typeSize, _start) do {} while (0)
+#endif
 /* Protocol classes: ProtoSimple, ProtoLL, ProtoLL128
  * We use these as template args to the Primtiives class instead of integral
  * enums (e.g. NCCL_PROTO_LL) because for SIMPLE we need to carry a few extra

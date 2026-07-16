@@ -416,6 +416,9 @@ struct ncclKernelComm {
   int buffSizes[NCCL_NUM_PROTOCOLS];
   int p2pChunkSize;
   int isAllNvlink;
+  int measureRingPrims;
+  uint64_t measureRingPrimsLogEvery;
+  uint64_t measureRingPrimsMinBytes;
 
   int* collNetDenseToUserRank;
 
