@@ -8,6 +8,9 @@
 #include "transport.h"
 #include "enqueue.h"
 #include "register_inline.h"
+#include "param.h"
+
+NCCL_PARAM(RegLogRingNetSkip, "REG_LOG_RING_NET_SKIP", 0);
 
 static ncclResult_t registerCheckP2PConnection(struct ncclComm* comm, struct ncclConnector* conn, struct ncclTopoGraph* graph, int peer, bool* needReg) {
   if (conn->connected) {
@@ -278,14 +281,18 @@ ncclResult_t ncclRegisterCollBuffers(
 
       NCCLCHECK(ncclRegFind(comm, info->recvbuff, recvbuffSize, &recvRegRecord));
       if (recvRegRecord == NULL && !(comm->planner.persistent && ncclParamGraphRegister())) {
-        INFO(NCCL_REG, "RING NET registration skipped: recv buffer is not registered func=%d sendbuff=%p recvbuff=%p sendSize=%zu recvSize=%zu",
-             info->func, info->sendbuff, info->recvbuff, sendbuffSize, recvbuffSize);
+        if (ncclParamRegLogRingNetSkip()) {
+          INFO(NCCL_REG, "RING NET registration skipped: recv buffer is not registered func=%d sendbuff=%p recvbuff=%p sendSize=%zu recvSize=%zu",
+               info->func, info->sendbuff, info->recvbuff, sendbuffSize, recvbuffSize);
+        }
         goto exit;
       }
       NCCLCHECK(ncclRegFind(comm, info->sendbuff, sendbuffSize, &sendRegRecord));
       if (sendRegRecord == NULL && !(comm->planner.persistent && ncclParamGraphRegister())) {
-        INFO(NCCL_REG, "RING NET registration skipped: send buffer is not registered func=%d sendbuff=%p recvbuff=%p sendSize=%zu recvSize=%zu",
-             info->func, info->sendbuff, info->recvbuff, sendbuffSize, recvbuffSize);
+        if (ncclParamRegLogRingNetSkip()) {
+          INFO(NCCL_REG, "RING NET registration skipped: send buffer is not registered func=%d sendbuff=%p recvbuff=%p sendSize=%zu recvSize=%zu",
+               info->func, info->sendbuff, info->recvbuff, sendbuffSize, recvbuffSize);
+        }
         goto exit;
       }
       NCCLCHECK(ncclCalloc(&sendNetConns, comm->nChannels));
@@ -340,7 +347,7 @@ ncclResult_t ncclRegisterCollBuffers(
 
       // start net registration
       regBufFlag = 0;
-      if (!hasSendNetPeer && !hasRecvNetPeer) {
+      if (!hasSendNetPeer && !hasRecvNetPeer && ncclParamRegLogRingNetSkip()) {
         INFO(NCCL_REG, "RING NET registration skipped: no NCCL_DIRECT_NIC ring peers func=%d sendbuff=%p recvbuff=%p sendSize=%zu recvSize=%zu",
              info->func, info->sendbuff, info->recvbuff, sendbuffSize, recvbuffSize);
       }
@@ -363,7 +370,7 @@ ncclResult_t ncclRegisterCollBuffers(
           if ((regBufFlag || !hasSendNetPeer) && hasRecvNetPeer)
             ncclNetLocalRegisterBuffer(comm, info->recvbuff, recvbuffSize, recvNetConns, recvNetPeers, &regBufFlag, recvNetHandles);
         }
-      } else {
+      } else if (ncclParamRegLogRingNetSkip()) {
         INFO(NCCL_REG, "RING NET registration skipped: useNetPXN=%d useGdr=%d netDeviceType=%d func=%d sendbuff=%p recvbuff=%p sendSize=%zu recvSize=%zu",
              comm->useNetPXN, comm->useGdr, comm->netDeviceType, info->func, info->sendbuff, info->recvbuff, sendbuffSize, recvbuffSize);
       }

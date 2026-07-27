@@ -17,12 +17,17 @@
 #include "ce_coll.h"
 #include "nvtx.h"
 #include "scheduler.h"
+#include "net.h"
 
 #include <cstring> // std::memcpy
 #include <cinttypes> // PRIx64
 #include <cassert>
 
 NCCL_PARAM(L1SharedMemoryCarveout, "L1_SHARED_MEMORY_CARVEOUT", 0);
+
+static void CUDART_CB ncclIbMeasureKernelActiveEndCallback(void*) {
+  ncclIbMeasureKernelActiveEnd();
+}
 
 // Returns maximum kernel stack size of all CUDA kernels
 ncclResult_t ncclInitKernelsForDevice(int cudaArch, int maxSharedMem, size_t* maxStackSize) {
@@ -1656,6 +1661,15 @@ ncclResult_t ncclLaunchKernel(struct ncclComm* comm, struct ncclKernelPlan* plan
   } else {
     // Standard kernel launch
     CUCHECKGOTO(cuLaunchKernel(fn, grid.x, grid.y, grid.z, block.x, block.y, block.z, smem, launchStream, nullptr, extra), ret, do_return);
+  }
+
+  if (ncclIbMeasureSendKernelOverlapEnabled() && !ncclCudaGraphValid(planner->capturingGraph)) {
+    ncclIbMeasureKernelActiveStart();
+    cudaError_t cbStatus = cudaLaunchHostFunc(launchStream, ncclIbMeasureKernelActiveEndCallback, nullptr);
+    if (cbStatus != cudaSuccess) {
+      ncclIbMeasureKernelActiveEnd();
+      CUDACHECKGOTO(cbStatus, ret, do_return);
+    }
   }
 
 do_return:

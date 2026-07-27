@@ -27,6 +27,7 @@ namespace {
     // Coverity reports that the callee treats &ring->next as an array.  However, due to the use of
     // FanSymmetric<1>, only the first element is ever accessed, so it's fine.
     // coverity[callee_ptr_arith:FALSE]
+    bool ringNextIsNet = (ncclShmem.channel.peers[ring->next]->send[0].flags & NCCL_DIRECT_NIC) != 0;
     Primitives<T, RedOp, FanSymmetric<1>, 0, Proto, 0>
       prims(tid, nthreads, &ring->prev, &ring->next, work->sendbuff, work->recvbuff, work->redOpArg);
 
@@ -41,7 +42,7 @@ namespace {
       {
         unsigned long long primStart = NCCL_RING_PRIM_MEASURE_START(tid);
         prims.send(offset, nelem);
-        NCCL_RING_PRIM_MEASURE_END(tid, "ReduceScatter", "send", elemOffset, chunkCount, nelem, sizeof(T), primStart);
+        NCCL_RING_PRIM_MEASURE_END_IF(ringNextIsNet, tid, "ReduceScatter", "send", elemOffset, chunkCount, nelem, sizeof(T), primStart);
       }
 
       // k-2 steps: reduce and copy to next GPU
@@ -51,7 +52,7 @@ namespace {
         {
           unsigned long long primStart = NCCL_RING_PRIM_MEASURE_START(tid);
           prims.recvReduceSend(offset, nelem);
-          NCCL_RING_PRIM_MEASURE_END(tid, "ReduceScatter", "recvReduceSend", elemOffset, chunkCount, nelem, sizeof(T), primStart);
+          NCCL_RING_PRIM_MEASURE_END_IF(ringNextIsNet, tid, "ReduceScatter", "recvReduceSend", elemOffset, chunkCount, nelem, sizeof(T), primStart);
         }
       }
 
@@ -61,7 +62,7 @@ namespace {
       {
         unsigned long long primStart = NCCL_RING_PRIM_MEASURE_START(tid);
         prims.recvReduceCopy(offset, dataOffset, nelem, /*postOp=*/true);
-        NCCL_RING_PRIM_MEASURE_END(tid, "ReduceScatter", "recvReduceCopy", elemOffset, chunkCount, nelem, sizeof(T), primStart);
+        NCCL_RING_PRIM_MEASURE_END_IF(0, tid, "ReduceScatter", "recvReduceCopy", elemOffset, chunkCount, nelem, sizeof(T), primStart);
       }
     }
   }

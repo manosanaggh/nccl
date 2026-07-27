@@ -133,10 +133,11 @@ NCCL_PARAM(IbUseInline, "IB_USE_INLINE", 0);
 NCCL_PARAM(IbSl, "IB_SL", -1);
 NCCL_PARAM(IbTc, "IB_TC", -1);
 NCCL_PARAM(IbMeasureSend, "IB_MEASURE_SEND", 0);
-NCCL_PARAM(IbMeasureSendLogEvery, "IB_MEASURE_SEND_LOG_EVERY", 1);
+NCCL_PARAM(IbMeasureSendLogEvery, "IB_MEASURE_SEND_LOG_EVERY", 0);
 NCCL_PARAM(IbMeasureSendMinBytes, "IB_MEASURE_SEND_MIN_BYTES", 0);
 NCCL_PARAM(IbMeasureSendBucketUs, "IB_MEASURE_SEND_BUCKET_US", 0);
 NCCL_PARAM(IbMeasureSendIdleNvtx, "IB_MEASURE_SEND_IDLE_NVTX", 0);
+NCCL_PARAM(IbMeasureSendKernelOverlap, "IB_MEASURE_SEND_KERNEL_OVERLAP", 0);
 NCCL_PARAM(IbArThreshold, "IB_AR_THRESHOLD", 8192);
 NCCL_PARAM(IbPciRelaxedOrdering, "IB_PCI_RELAXED_ORDERING", 2);
 NCCL_PARAM(IbAdaptiveRouting, "IB_ADAPTIVE_ROUTING", -2);
@@ -190,12 +191,88 @@ static uint64_t ncclIbMeasureSendIdleOutstanding = 0;
 static uint64_t ncclIbMeasureSendIdleStartNs = 0;
 static const char* ncclIbMeasureSendIdlePath = NULL;
 static uint64_t ncclIbMeasureSendIdleCount = 0;
+static uint64_t ncclIbMeasureSendIdleTotalNs = 0;
+static uint64_t ncclIbMeasureSendIdleInsideKernelNs = 0;
+static uint64_t ncclIbMeasureSendIdleOutsideKernelNs = 0;
+static uint64_t ncclIbMeasureSendKernelActiveNs = 0;
+static uint64_t ncclIbMeasureSendKernelActiveCount = 0;
+static uint64_t ncclIbMeasureSendKernelActiveEntries = 0;
+static uint64_t ncclIbMeasureSendLastStateNs = 0;
 static nvtxRangeId_t ncclIbMeasureSendIdleNvtxRange = 0;
 
 static inline uint64_t ncclIbMeasureSendNowNs() {
   struct timespec ts;
   clock_gettime(CLOCK_MONOTONIC, &ts);
   return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+}
+
+bool ncclIbMeasureSendKernelOverlapEnabled() {
+  return ncclParamIbMeasureSendKernelOverlap() != 0;
+}
+
+static inline bool ncclIbMeasureSendTrackingEnabled() {
+  return ncclParamIbMeasureSend() || ncclParamIbMeasureSendIdleNvtx() ||
+      ncclParamIbMeasureSendBucketUs() > 0 || ncclIbMeasureSendKernelOverlapEnabled();
+}
+
+static inline void ncclIbMeasureSendAccountStateLocked(uint64_t eventNs) {
+  if (ncclIbMeasureSendLastStateNs == 0) {
+    ncclIbMeasureSendLastStateNs = eventNs;
+    return;
+  }
+  if (eventNs < ncclIbMeasureSendLastStateNs) eventNs = ncclIbMeasureSendLastStateNs;
+  uint64_t dt = eventNs - ncclIbMeasureSendLastStateNs;
+  if (dt != 0) {
+    if (ncclIbMeasureSendIdleOutstanding == 0 && ncclIbMeasureSendIdleStartNs != 0) {
+      if (ncclIbMeasureSendKernelActiveCount != 0) {
+        ncclIbMeasureSendIdleInsideKernelNs += dt;
+      } else {
+        ncclIbMeasureSendIdleOutsideKernelNs += dt;
+      }
+    }
+    if (ncclIbMeasureSendKernelActiveCount != 0) ncclIbMeasureSendKernelActiveNs += dt;
+  }
+  ncclIbMeasureSendLastStateNs = eventNs;
+}
+
+void ncclIbMeasureKernelActiveStart() {
+  if (!ncclIbMeasureSendKernelOverlapEnabled()) return;
+  uint64_t nowNs = ncclIbMeasureSendNowNs();
+  std::lock_guard<std::mutex> lock(ncclIbMeasureSendIdleMutex);
+  ncclIbMeasureSendAccountStateLocked(nowNs);
+  if (ncclIbMeasureSendKernelActiveCount++ == 0) ncclIbMeasureSendKernelActiveEntries++;
+}
+
+void ncclIbMeasureKernelActiveEnd() {
+  if (!ncclIbMeasureSendKernelOverlapEnabled()) return;
+  uint64_t nowNs = ncclIbMeasureSendNowNs();
+  std::lock_guard<std::mutex> lock(ncclIbMeasureSendIdleMutex);
+  ncclIbMeasureSendAccountStateLocked(nowNs);
+  if (ncclIbMeasureSendKernelActiveCount != 0) ncclIbMeasureSendKernelActiveCount--;
+}
+
+static void ncclIbMeasureSendIdleSummary() __attribute__((destructor));
+static void ncclIbMeasureSendIdleSummary() {
+  if (!ncclIbMeasureSendTrackingEnabled()) return;
+  std::lock_guard<std::mutex> lock(ncclIbMeasureSendIdleMutex);
+  uint64_t nowNs = ncclIbMeasureSendNowNs();
+  ncclIbMeasureSendAccountStateLocked(nowNs);
+  uint64_t idleCount = ncclIbMeasureSendIdleCount +
+      ((ncclIbMeasureSendIdleOutstanding == 0 && ncclIbMeasureSendIdleStartNs != 0) ? 1 : 0);
+  uint64_t idleTotalNs = ncclIbMeasureSendIdleInsideKernelNs + ncclIbMeasureSendIdleOutsideKernelNs;
+  double totalS = (double)idleTotalNs / 1000000000.0;
+  double avgUs = idleCount == 0 ? 0.0 : (double)idleTotalNs / (double)idleCount / 1000.0;
+  double insideS = (double)ncclIbMeasureSendIdleInsideKernelNs / 1000000000.0;
+  double outsideS = (double)ncclIbMeasureSendIdleOutsideKernelNs / 1000000000.0;
+  double kernelS = (double)ncclIbMeasureSendKernelActiveNs / 1000000000.0;
+  double insidePct = idleTotalNs == 0 ? 0.0 : 100.0 * (double)ncclIbMeasureSendIdleInsideKernelNs / (double)idleTotalNs;
+  double outsidePct = idleTotalNs == 0 ? 0.0 : 100.0 * (double)ncclIbMeasureSendIdleOutsideKernelNs / (double)idleTotalNs;
+  INFO(NCCL_NET,
+       "NET/IB: send measure idle summary count=%llu total_idle_ns=%llu total_idle_s=%.6f avg_idle_us=%.3f idle_inside_kernel_s=%.6f idle_outside_kernel_s=%.6f idle_inside_kernel_pct=%.2f idle_outside_kernel_pct=%.2f kernel_active_s=%.6f kernel_active_entries=%llu kernel_active_open=%llu",
+       (unsigned long long)idleCount, (unsigned long long)idleTotalNs, totalS, avgUs,
+       insideS, outsideS, insidePct, outsidePct, kernelS,
+       (unsigned long long)ncclIbMeasureSendKernelActiveEntries,
+       (unsigned long long)ncclIbMeasureSendKernelActiveCount);
 }
 
 static ncclResult_t ncclIbStatsInit(struct ncclIbStats* stat) {
@@ -1154,7 +1231,7 @@ struct ncclIbRequest {
 };
 
 static inline void ncclIbMeasureSendStart(struct ncclIbRequest* req, uint64_t bytes) {
-  if (!ncclParamIbMeasureSend()) return;
+  if (!ncclIbMeasureSendTrackingEnabled()) return;
   req->measureStartNs = ncclIbMeasureSendNowNs();
   req->measurePostDoneNs = 0;
   req->measureBytes = bytes;
@@ -1296,17 +1373,13 @@ static inline void ncclIbMeasureSendOutstandingBucketEvent(const char* path, uin
 
 static inline void ncclIbMeasureSendIdleEvent(const char* path, uint64_t eventNs, int delta) {
   std::lock_guard<std::mutex> lock(ncclIbMeasureSendIdleMutex);
+  ncclIbMeasureSendAccountStateLocked(eventNs);
   if (delta > 0) {
     if (ncclIbMeasureSendIdleOutstanding == 0 && ncclIbMeasureSendIdleStartNs != 0) {
       if (eventNs < ncclIbMeasureSendIdleStartNs) eventNs = ncclIbMeasureSendIdleStartNs;
       uint64_t idleNs = eventNs - ncclIbMeasureSendIdleStartNs;
-      uint64_t sample = ++ncclIbMeasureSendIdleCount;
-      const char* idlePath = path ? path : ncclIbMeasureSendIdlePath;
-      INFO(NCCL_NET,
-           "NET/IB: send measure idle path=%s sample=%llu idle_start_ns=%llu idle_end_ns=%llu idle_us=%.3f",
-           idlePath ? idlePath : "unknown", (unsigned long long)sample,
-           (unsigned long long)ncclIbMeasureSendIdleStartNs, (unsigned long long)eventNs,
-           (double)idleNs / 1000.0);
+      ++ncclIbMeasureSendIdleCount;
+      ncclIbMeasureSendIdleTotalNs += idleNs;
       ncclIbMeasureSendIdleNvtxEnd();
       ncclIbMeasureSendIdleStartNs = 0;
       ncclIbMeasureSendIdlePath = NULL;
@@ -1324,7 +1397,7 @@ static inline void ncclIbMeasureSendIdleEvent(const char* path, uint64_t eventNs
 }
 
 static inline void ncclIbMeasureSendPostDone(struct ncclIbRequest* req, uint64_t postDoneNs) {
-  if (!ncclParamIbMeasureSend() || req->measureStartNs == 0) return;
+  if (!ncclIbMeasureSendTrackingEnabled() || req->measureStartNs == 0) return;
   req->measurePostDoneNs = postDoneNs;
   if (!ncclIbMeasureSendIsTrackedBytes(req->measureBytes)) return;
   ncclIbMeasureSendIdleEvent(NULL, postDoneNs, 1);
@@ -1351,7 +1424,7 @@ static inline int ncclIbRequestDone(struct ncclIbRequest* req) {
 }
 
 static inline void ncclIbMeasureSendLogStart(struct ncclIbRequest** reqs, int nreqs, int slot, int tag) {
-  if (!ncclParamIbMeasureSend()) return;
+  if (!ncclParamIbMeasureSend() || ncclParamIbMeasureSendLogEvery() <= 0) return;
   uint64_t sample = ncclIbMeasureSendStartLogCount.fetch_add(1, std::memory_order_relaxed) + 1;
   if (sample > 16) return;
 
@@ -1510,7 +1583,7 @@ static inline void ncclIbMeasureSendIntervalBucketFlushSafe(uint64_t completeNs)
 }
 
 static inline void ncclIbMeasureSendComplete(struct ncclIbRequest* req, const char* path) {
-  if (!ncclParamIbMeasureSend() || req->measureStartNs == 0) return;
+  if (!ncclIbMeasureSendTrackingEnabled() || req->measureStartNs == 0) return;
   uint64_t bytes = req->measureBytes;
   uint64_t completeNs = ncclIbMeasureSendNowNs();
   uint64_t startNs = req->measureStartNs;
@@ -1530,7 +1603,7 @@ static inline void ncclIbMeasureSendComplete(struct ncclIbRequest* req, const ch
   ncclIbMeasureSendIntervalBucketFlushSafe(completeNs);
 
   int64_t logEvery = ncclParamIbMeasureSendLogEvery();
-  if (logEvery <= 0) logEvery = 1;
+  if (logEvery <= 0) return;
   uint64_t sample = ncclIbMeasureSendLogCount.fetch_add(1, std::memory_order_relaxed) + 1;
   if ((sample % (uint64_t)logEvery) != 0) return;
 
@@ -2579,7 +2652,7 @@ ncclResult_t ncclIbMultiSend(struct ncclIbSendComm* comm, int slot) {
   int nqps = ncclParamIbSplitDataOnQps() ? comm->base.nqps : comm->base.nDataQps;
   uint64_t measurePostStartNs = 0;
   uint64_t measurePostDoneNs = 0;
-  bool measureSend = ncclParamIbMeasureSend();
+  bool measureSend = ncclIbMeasureSendTrackingEnabled();
   for (int i = 0; i < nqps; i++) {
     int qpIndex = comm->base.qpIndex;
     ncclIbQp* qp = comm->base.qps + qpIndex;

@@ -32,4 +32,8 @@ extern ncclNet_t ncclNetSocket;
 extern ncclGin_t ncclGinIbGdaki;
 extern ncclGin_t ncclGinIbProxy;
 
+bool ncclIbMeasureSendKernelOverlapEnabled();
+void ncclIbMeasureKernelActiveStart();
+void ncclIbMeasureKernelActiveEnd();
+
 #endif

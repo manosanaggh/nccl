@@ -182,7 +182,7 @@ class Primitives<
 
   template <int DirectRecv1, int DirectSend1, int Recv, int Send, int SrcBuf, int DstBuf>
   __device__ __forceinline__ void genericOp(
-      intptr_t srcIx, intptr_t dstIx, int nelem, bool postOp
+      intptr_t srcIx, intptr_t dstIx, int nelem, bool postOp, const char* primName = "genericOp"
     ) {
     constexpr int DirectRecv = 1 && Direct && DirectRecv1;
     constexpr int DirectSend = 1 && Direct && DirectSend1;
@@ -244,30 +244,49 @@ class Primitives<
           subBarrier();
         }
 
+        bool measureIbStagingCopy = false;
+        if (Send && tid == 0) {
+          ncclConnInfo* sendConn = ncclShmem.groups[group].sendConns[0];
+          int sendDstIndex = Dst ? 1 : 0;
+          if (sendConn != nullptr && !(sendConn->flags & (NCCL_P2P_READ | NCCL_P2P_WRITE))) {
+            char* sendBuffBeg = sendConn->buffs[NCCL_PROTO_SIMPLE];
+            char* dstPtr = (char*)ncclShmem.groups[group].dsts[sendDstIndex];
+            if (sendBuffBeg != nullptr && dstPtr != nullptr) {
+              char* sendBuffEnd = sendBuffBeg + sendConn->stepSize * NCCL_STEPS;
+              measureIbStagingCopy = dstPtr >= sendBuffBeg && dstPtr < sendBuffEnd;
+            }
+          }
+        }
+
         if (DirectRecv && ncclShmem.groups[group].srcs[0] == ncclShmem.groups[group].dsts[0]
             /* NVLS can have srcs[0] == dsts[0], but we cannot enter this "if branch",
              * so we need to check whether MultimemSrcs and MultimemDsts are 0. */
             && MultimemSrcs == 0 && MultimemDsts == 0 && !Src) {
           // We can only have one direct receive. Since srcs[0] == dstPtr+offset, skip one copy
           if (Send && Dst && ncclShmem.groups[group].srcs[0] != ncclShmem.groups[group].dsts[1]) {
+            unsigned long long stagingCopyStart = NCCL_RING_IB_STAGING_COPY_MEASURE_START(measureIbStagingCopy, tid);
             reduceCopy<Unroll, RedOp, T, 0, 1, 1, 0, 1, MaxSend, /*PreOpSrcs*/0>
               (tid, nworkers, /*redArg*/0, /*preOpArgs*/nullptr, /*postOp*/false,
                1, ncclShmem.groups[group].srcs,
                fan.nsend(), ncclShmem.groups[group].dsts+1,
                workSize);
+            NCCL_RING_IB_STAGING_COPY_MEASURE_END(measureIbStagingCopy, tid, primName, workSize, sizeof(T), stagingCopyStart);
           }
         } else if (DirectSend && !DirectRecv && SrcBuf != Input && ncclShmem.groups[group].dsts[Dst] == nullptr) {
           // For broadcast in CollNet to do empty send
+          unsigned long long stagingCopyStart = NCCL_RING_IB_STAGING_COPY_MEASURE_START(measureIbStagingCopy, tid);
           reduceCopy<Unroll, RedOp, T, 0, 1, 1, 0, 1, 1, /*PreOpSrcs*/0>
             (tid, nworkers, ncclShmem.redOpArgs[0],  nullptr, postOp,
              Recv, ncclShmem.groups[group].srcs,
              Dst, ncclShmem.groups[group].dsts,
              workSize);
+          NCCL_RING_IB_STAGING_COPY_MEASURE_END(measureIbStagingCopy, tid, primName, workSize, sizeof(T), stagingCopyStart);
         } else if (ncclShmem.groups[group].srcs[0] && ncclShmem.groups[group].dsts[0]) {
           constexpr int PreOpSrcs = SrcBuf != Input ? 0 :
                                     DirectRecv*MaxRecv == NCCL_MAX_DIRECT_ARITY ? (1+NCCL_MAX_DIRECT_ARITY) : 1;
           if (Send && Dst && ncclShmem.groups[group].dsts[1] == nullptr) {
             // this case should only be directCopySend() with registered buffers and send to net peer
+            unsigned long long stagingCopyStart = NCCL_RING_IB_STAGING_COPY_MEASURE_START(measureIbStagingCopy, tid);
             reduceCopy<Unroll, RedOp, T,
               0, Recv + Src, Recv * MaxRecv + Src,
               0, 1, 1, PreOpSrcs>
@@ -275,7 +294,9 @@ class Primitives<
                 Recv * fan.nrecv() + Src, ncclShmem.groups[group].srcs,
                 1, ncclShmem.groups[group].dsts,
                 workSize);
+            NCCL_RING_IB_STAGING_COPY_MEASURE_END(measureIbStagingCopy, tid, primName, workSize, sizeof(T), stagingCopyStart);
           } else {
+            unsigned long long stagingCopyStart = NCCL_RING_IB_STAGING_COPY_MEASURE_START(measureIbStagingCopy, tid);
             reduceCopy<Unroll, RedOp, T,
               MultimemSrcs, Recv + Src, Recv * MaxRecv + Src,
               MultimemDsts, Send + Dst, Send * MaxSend + Dst, PreOpSrcs>
@@ -283,6 +304,7 @@ class Primitives<
                 Recv * fan.nrecv() + Src, ncclShmem.groups[group].srcs,
                 Send * fan.nsend() + Dst, ncclShmem.groups[group].dsts,
                 workSize);
+            NCCL_RING_IB_STAGING_COPY_MEASURE_END(measureIbStagingCopy, tid, primName, workSize, sizeof(T), stagingCopyStart);
           }
         } else {
           // we will come here when calling prims.directSend with net peer,
@@ -855,13 +877,13 @@ private:
   }
 
   __device__ __forceinline__ void send(intptr_t inpIx, int eltN) {
-    genericOp<0, 0, 0, 1, Input, -1>(inpIx, -1, eltN, false);
+    genericOp<0, 0, 0, 1, Input, -1>(inpIx, -1, eltN, false, "send");
   }
   __device__ __forceinline__ void sendFromOutput(intptr_t outIx, int eltN) {
     genericOp<0, 0, 0, 1, Output, -1>(outIx, -1, eltN, false);
   }
   __device__ __forceinline__ void directSend(intptr_t inpIx, intptr_t outIx, int eltN) {
-    genericOp<0, 1, 0, 1, Input, -1>(inpIx, outIx, eltN, false);
+    genericOp<0, 1, 0, 1, Input, -1>(inpIx, outIx, eltN, false, "directSend");
   }
   __device__ __forceinline__ void directSendFromOutput(intptr_t outIx, int eltN) {
     genericOp<0, 1, 0, 1, Output, -1>(outIx, outIx, eltN, false);
@@ -881,7 +903,7 @@ private:
     genericOp<0, 0, 0, 1, Input, Output>(inpIx, outIx, eltN, postOp);
   }
   __device__ __forceinline__ void directCopySend(intptr_t inpIx, intptr_t outIx, int eltN, bool postOp=false) {
-    genericOp<0, 1, 0, 1, Input, Output>(inpIx, outIx, eltN, postOp);
+    genericOp<0, 1, 0, 1, Input, Output>(inpIx, outIx, eltN, postOp, "directCopySend");
   }
 
   __device__ __forceinline__ void recvSend(int eltN, bool postOp=false) {
@@ -891,7 +913,7 @@ private:
     genericOp<0, 0, 1, 1, -1, Output>(-1, outIx, eltN, postOp);
   }
   __device__ __forceinline__ void directRecvCopyDirectSend(intptr_t inpIx, intptr_t outIx, int eltN, bool postOp=false) {
-    genericOp<1, 1, 1, 1, -1, Output>(inpIx, outIx, eltN, postOp);
+    genericOp<1, 1, 1, 1, -1, Output>(inpIx, outIx, eltN, postOp, "directRecvCopyDirectSend");
   }
   __device__ __forceinline__ void directRecvDirectSend(intptr_t inpIx, intptr_t outIx, int eltN, bool postOp=false) {
     genericOp<1, 1, 1, 1, -1, -1>(inpIx, outIx, eltN, postOp);
@@ -907,14 +929,14 @@ private:
   }
 
   __device__ __forceinline__ void recvReduceCopy(intptr_t inpIx, intptr_t outIx, int eltN, bool postOp=false) {
-    genericOp<0, 0, 1, 0, Input, Output>(inpIx, outIx, eltN, postOp);
+    genericOp<0, 0, 1, 0, Input, Output>(inpIx, outIx, eltN, postOp, "recvReduceCopy");
   }
   __device__ __forceinline__ void directRecvReduceCopy(intptr_t inpIx, intptr_t outIx, int eltN, bool postOp=false) {
     genericOp<1, 0, 1, 0, Input, Output>(inpIx, outIx, eltN, postOp);
   }
 
   __device__ __forceinline__ void recvReduceSend(intptr_t inpIx, int eltN, bool postOp=false) {
-    genericOp<0, 0, 1, 1, Input, -1>(inpIx, -1, eltN, postOp);
+    genericOp<0, 0, 1, 1, Input, -1>(inpIx, -1, eltN, postOp, "recvReduceSend");
   }
   __device__ __forceinline__ void directRecvReduceSend(intptr_t inpIx, int eltN, bool postOp=false) {
     genericOp<1, 0, 1, 1, Input, -1>(inpIx, -1, eltN, postOp);

@@ -354,6 +354,27 @@ NCCL_PARAM(DeviceMeasureRingPrims, "DEVICE_MEASURE_RING_PRIMS", 0);
 NCCL_PARAM(DeviceMeasureRingPrimsLogEvery, "DEVICE_MEASURE_RING_PRIMS_LOG_EVERY", 1);
 NCCL_PARAM(DeviceMeasureRingPrimsMinBytes, "DEVICE_MEASURE_RING_PRIMS_MIN_BYTES", 0);
 
+static std::mutex ncclRingIbStagingCopySummaryMutex;
+static uint64_t ncclRingIbStagingCopySummaryComms = 0;
+static uint64_t ncclRingIbStagingCopySummaryCount = 0;
+static uint64_t ncclRingIbStagingCopySummaryBytes = 0;
+static uint64_t ncclRingIbStagingCopySummaryNs = 0;
+
+static void ncclRingIbStagingCopySummary() __attribute__((destructor));
+static void ncclRingIbStagingCopySummary() {
+  if (!ncclParamDeviceMeasureRingPrims()) return;
+  std::lock_guard<std::mutex> lock(ncclRingIbStagingCopySummaryMutex);
+  double totalS = (double)ncclRingIbStagingCopySummaryNs / 1000000000.0;
+  double avgUs = ncclRingIbStagingCopySummaryCount == 0 ? 0.0 :
+      (double)ncclRingIbStagingCopySummaryNs / (double)ncclRingIbStagingCopySummaryCount / 1000.0;
+  INFO(NCCL_NET,
+       "RING_IB_STAGING_COPY summary comms=%llu count=%llu bytes=%llu total_time_ns=%llu total_time_s=%.6f avg_us=%.3f",
+       (unsigned long long)ncclRingIbStagingCopySummaryComms,
+       (unsigned long long)ncclRingIbStagingCopySummaryCount,
+       (unsigned long long)ncclRingIbStagingCopySummaryBytes,
+       (unsigned long long)ncclRingIbStagingCopySummaryNs, totalS, avgUs);
+}
+
 // Detect DMA-BUF support
 static ncclResult_t dmaBufSupported(struct ncclComm* comm) {
   if (ncclParamDmaBufEnable() == 0 || comm->ncclNet->regMrDmaBuf == NULL || ncclCudaLibraryInit() != ncclSuccess) return ncclInternalError;
@@ -527,6 +548,13 @@ static ncclResult_t devCommSetup(ncclComm_t comm) {
   tmpCommAndChans.comm.measureRingPrims = ncclParamDeviceMeasureRingPrims() != 0;
   tmpCommAndChans.comm.measureRingPrimsLogEvery = std::max<int64_t>(1, ncclParamDeviceMeasureRingPrimsLogEvery());
   tmpCommAndChans.comm.measureRingPrimsMinBytes = std::max<int64_t>(0, ncclParamDeviceMeasureRingPrimsMinBytes());
+  tmpCommAndChans.comm.measureRingPrimsStats = NULL;
+  comm->measureRingPrimsStats = NULL;
+  if (tmpCommAndChans.comm.measureRingPrims) {
+    NCCLCHECKGOTO(ncclCudaCallocAsync(&comm->measureRingPrimsStats, 3, deviceStream), ret, fail);
+    ncclCommPushCudaFree(comm, comm->measureRingPrimsStats);
+    tmpCommAndChans.comm.measureRingPrimsStats = comm->measureRingPrimsStats;
+  }
   for (int p=0; p < NCCL_NUM_PROTOCOLS; p++) {
     tmpCommAndChans.comm.buffSizes[p] = comm->buffSizes[p];
   }
@@ -2230,6 +2258,16 @@ static ncclResult_t commDestroySync(struct ncclAsyncJob* job_) {
     }
     if ((ret = ncclStrongStreamSynchronize(&comm->sharedRes->deviceStream)) != ncclSuccess) {
       WARN("commDestroySync: comm %p rank %d sync deviceStream error %d\n", comm, comm->rank, ret);
+    }
+
+    if (comm->measureRingPrimsStats != NULL) {
+      uint64_t ringPrimStats[3] = {0, 0, 0};
+      CUDACHECKGOTO(cudaMemcpy(ringPrimStats, comm->measureRingPrimsStats, 3 * sizeof(uint64_t), cudaMemcpyDeviceToHost), ret, fail);
+      std::lock_guard<std::mutex> lock(ncclRingIbStagingCopySummaryMutex);
+      ncclRingIbStagingCopySummaryComms++;
+      ncclRingIbStagingCopySummaryCount += ringPrimStats[0];
+      ncclRingIbStagingCopySummaryBytes += ringPrimStats[1];
+      ncclRingIbStagingCopySummaryNs += ringPrimStats[2];
     }
 
     NCCLCHECKGOTO(ncclCommPollEventCallbacks(comm, true), ret, fail);
