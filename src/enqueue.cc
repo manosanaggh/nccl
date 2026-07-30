@@ -742,10 +742,11 @@ static ncclResult_t scheduleCollTasksToPlan(
     // Profiler
     plan->groupApiEventHandle = task->groupApiEventHandle;
 
-    if (ncclCodepathTraceTake()) {
+    size_t codepathMsgBytes = task->count * ncclTypeSize(task->datatype);
+    if (ncclCodepathTraceTake(codepathMsgBytes)) {
       INFO(NCCL_COLL,
            "NCCL CODEPATH coll rank=%d func=%s msgBytes=%zu trafficBytes=%zu algo=%s proto=%s devFuncId=%u nMaxChannels=%d nWarps=%d channelLo=%d channelHi=%d regBufType=%d isCollnet=%u isNvls=%u hasProxyOps=%d chunkSteps=%d sliceSteps=%d",
-           comm->rank, ncclFuncToString(task->func), task->count * ncclTypeSize(task->datatype), task->trafficBytes,
+           comm->rank, ncclFuncToString(task->func), codepathMsgBytes, task->trafficBytes,
            ncclAlgoToString(task->algorithm), ncclProtoToString(task->protocol), task->devFuncId, task->nMaxChannels,
            task->nWarps, devWork->channelLo, devWork->channelHi, task->regBufType,
            task->isCollnet, task->isNvls, plan->hasProxyOps ? 1 : 0, task->chunkSteps, task->sliceSteps);
@@ -1588,7 +1589,7 @@ ncclResult_t ncclLaunchKernel(struct ncclComm* comm, struct ncclKernelPlan* plan
 
   NCCLCHECK(ncclProfilerStartKernelLaunchEvent(plan, launchStream));
 
-  if (ncclCodepathTraceTake()) {
+  if (ncclCodepathTraceTake(plan->workBytes)) {
     INFO(NCCL_COLL,
          "NCCL CODEPATH kernel_launch rank=%d plan=%p channels=%d channelMask=0x%llx threads=%d smem=%d workBytes=%zu collOpCount=%d nWorkBatches=%d hasProxyOps=%d persistent=%d isHostCbEnq=%d isSymColl=%d isCeColl=%d kernelSpecialized=%d stream=%p",
          comm->rank, plan, nChannels, (unsigned long long)plan->channelMask, plan->threadPerBlock, smem,
@@ -2519,7 +2520,8 @@ static ncclResult_t collTaskAppend(
   t->groupApiEventHandle = ncclProfilerApiState.groupApiEventHandle;
   t->collApiEventHandle = ncclProfilerApiState.collApiEventHandle;
 
-  if (ncclCodepathTraceTake()) {
+  size_t codepathMsgBytes = t->count * ncclTypeSize(t->datatype);
+  if (ncclCodepathTraceTake(codepathMsgBytes)) {
     INFO(NCCL_COLL,
          "NCCL CODEPATH task_append rank=%d func=%s count=%zu datatype=%s elemBytes=%zu trafficBytes=%zu sendbuff=%p recvbuff=%p chunkSteps=%d sliceSteps=%d nRanks=%d nNodes=%d stream=%p",
          comm->rank, ncclFuncToString(t->func), t->count, ncclDatatypeToString(t->datatype),

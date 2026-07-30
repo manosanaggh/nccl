@@ -137,6 +137,7 @@ NCCL_PARAM(IbMeasureSendIdleNvtx, "IB_MEASURE_SEND_IDLE_NVTX", 0);
 NCCL_PARAM(IbMeasureSendKernelOverlap, "IB_MEASURE_SEND_KERNEL_OVERLAP", 0);
 NCCL_PARAM(CodepathTrace, "CODEPATH_TRACE", 0);
 NCCL_PARAM(CodepathTraceLimit, "CODEPATH_TRACE_LIMIT", 64);
+NCCL_PARAM(CodepathTraceMinBytes, "CODEPATH_TRACE_MIN_BYTES", 0);
 NCCL_PARAM(IbArThreshold, "IB_AR_THRESHOLD", 8192);
 NCCL_PARAM(IbPciRelaxedOrdering, "IB_PCI_RELAXED_ORDERING", 2);
 NCCL_PARAM(IbAdaptiveRouting, "IB_ADAPTIVE_ROUTING", -2);
@@ -176,8 +177,10 @@ bool ncclCodepathTraceEnabled() {
   return ncclParamCodepathTrace() != 0;
 }
 
-bool ncclCodepathTraceTake() {
+bool ncclCodepathTraceTake(uint64_t bytes) {
   if (!ncclCodepathTraceEnabled()) return false;
+  int64_t minBytes = ncclParamCodepathTraceMinBytes();
+  if (minBytes > 0 && bytes < (uint64_t)minBytes) return false;
   int64_t limit = ncclParamCodepathTraceLimit();
   if (limit < 0) return true;
   uint64_t sample = ncclCodepathTraceCount.fetch_add(1, std::memory_order_relaxed);
@@ -2356,7 +2359,7 @@ ncclResult_t ncclIbMultiSend(struct ncclIbSendComm* comm, int slot) {
   uint64_t measurePostStartNs = 0;
   uint64_t measurePostDoneNs = 0;
   bool measureSend = ncclIbMeasureSendTrackingEnabled();
-  if (ncclCodepathTraceTake()) {
+  if (ncclCodepathTraceEnabled()) {
     uint64_t totalBytes = 0;
     int minBytes = nreqs == 0 ? 0 : reqs[0]->send.size;
     int maxBytes = 0;
@@ -2366,11 +2369,13 @@ ncclResult_t ncclIbMultiSend(struct ncclIbSendComm* comm, int slot) {
       if (size < minBytes) minBytes = size;
       if (size > maxBytes) maxBytes = size;
     }
-    INFO(NCCL_NET,
+    if (ncclCodepathTraceTake(totalBytes)) {
+      INFO(NCCL_NET,
          "NCCL CODEPATH ib_multisend slot=%d nreqs=%d totalBytes=%llu minBytes=%d maxBytes=%d nqps=%d nDataQps=%d splitDataOnQps=%lld ar=%d devIndex=%d nRemDevs=%d vNDevs=%d ready=%d",
          slot, nreqs, (unsigned long long)totalBytes, minBytes, maxBytes, nqps, comm->base.nDataQps,
          (long long)ncclParamIbSplitDataOnQps(), comm->ar, comm->base.devIndex, comm->base.nRemDevs,
          comm->base.vProps.ndevs, comm->base.ready);
+    }
   }
   for (int i = 0; i < nqps; i++) {
     int qpIndex = comm->base.qpIndex;

@@ -482,7 +482,8 @@ ncclResult_t ncclRegisterCollBuffers(
     }
   }
 exit:
-  if (ncclCodepathTraceTake()) {
+  size_t codepathBytes = codepathSendSize > codepathRecvSize ? codepathSendSize : codepathRecvSize;
+  if (ncclCodepathTraceTake(codepathBytes)) {
     INFO(NCCL_REG,
          "NCCL CODEPATH reg rank=%d func=%s algo=%s proto=%s sendSize=%zu recvSize=%zu regBufType=%d regNeedConnect=%d localRegister=%lld graphRegister=%lld persistent=%d nCleanup=%d sendMhandle=%p recvMhandle=%p sendNetHandles=%p recvNetHandles=%p srecvNetHandles=%p",
          comm->rank, ncclFuncToString(info->func), ncclAlgoToString(info->algorithm), ncclProtoToString(info->protocol),

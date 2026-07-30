@@ -36,6 +36,6 @@ bool ncclIbMeasureSendKernelOverlapEnabled();
 void ncclIbMeasureKernelActiveStart();
 void ncclIbMeasureKernelActiveEnd();
 bool ncclCodepathTraceEnabled();
-bool ncclCodepathTraceTake();
+bool ncclCodepathTraceTake(uint64_t bytes);
 
 #endif
