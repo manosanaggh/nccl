@@ -744,10 +744,10 @@ static ncclResult_t scheduleCollTasksToPlan(
 
     if (ncclCodepathTraceTake()) {
       INFO(NCCL_COLL,
-           "NCCL CODEPATH coll rank=%d func=%s msgBytes=%zu trafficBytes=%zu algo=%s proto=%s devFuncId=%u nMaxChannels=%d nWarps=%d channelLo=%d channelHi=%d regBufType=%d regNeedConnect=%d isCollnet=%u isNvls=%u hasProxyOps=%d chunkSteps=%d sliceSteps=%d",
+           "NCCL CODEPATH coll rank=%d func=%s msgBytes=%zu trafficBytes=%zu algo=%s proto=%s devFuncId=%u nMaxChannels=%d nWarps=%d channelLo=%d channelHi=%d regBufType=%d isCollnet=%u isNvls=%u hasProxyOps=%d chunkSteps=%d sliceSteps=%d",
            comm->rank, ncclFuncToString(task->func), task->count * ncclTypeSize(task->datatype), task->trafficBytes,
            ncclAlgoToString(task->algorithm), ncclProtoToString(task->protocol), task->devFuncId, task->nMaxChannels,
-           task->nWarps, devWork->channelLo, devWork->channelHi, task->regBufType, regNeedConnect ? 1 : 0,
+           task->nWarps, devWork->channelLo, devWork->channelHi, task->regBufType,
            task->isCollnet, task->isNvls, plan->hasProxyOps ? 1 : 0, task->chunkSteps, task->sliceSteps);
     }
 
