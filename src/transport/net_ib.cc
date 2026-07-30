@@ -138,6 +138,8 @@ NCCL_PARAM(IbMeasureSendMinBytes, "IB_MEASURE_SEND_MIN_BYTES", 0);
 NCCL_PARAM(IbMeasureSendBucketUs, "IB_MEASURE_SEND_BUCKET_US", 0);
 NCCL_PARAM(IbMeasureSendIdleNvtx, "IB_MEASURE_SEND_IDLE_NVTX", 0);
 NCCL_PARAM(IbMeasureSendKernelOverlap, "IB_MEASURE_SEND_KERNEL_OVERLAP", 0);
+NCCL_PARAM(CodepathTrace, "CODEPATH_TRACE", 0);
+NCCL_PARAM(CodepathTraceLimit, "CODEPATH_TRACE_LIMIT", 64);
 NCCL_PARAM(IbArThreshold, "IB_AR_THRESHOLD", 8192);
 NCCL_PARAM(IbPciRelaxedOrdering, "IB_PCI_RELAXED_ORDERING", 2);
 NCCL_PARAM(IbAdaptiveRouting, "IB_ADAPTIVE_ROUTING", -2);
@@ -148,6 +150,7 @@ NCCL_PARAM(IbDataDirect,"IB_DATA_DIRECT",1);
 
 static std::atomic<uint64_t> ncclIbMeasureSendLogCount{0};
 static std::atomic<uint64_t> ncclIbMeasureSendStartLogCount{0};
+static std::atomic<uint64_t> ncclCodepathTraceCount{0};
 static std::mutex ncclIbMeasureSendBucketMutex;
 static bool ncclIbMeasureSendBucketInitialized = false;
 static uint64_t ncclIbMeasureSendBucketStartNs = 0;
@@ -208,6 +211,18 @@ static inline uint64_t ncclIbMeasureSendNowNs() {
 
 bool ncclIbMeasureSendKernelOverlapEnabled() {
   return ncclParamIbMeasureSendKernelOverlap() != 0;
+}
+
+bool ncclCodepathTraceEnabled() {
+  return ncclParamCodepathTrace() != 0;
+}
+
+bool ncclCodepathTraceTake() {
+  if (!ncclCodepathTraceEnabled()) return false;
+  int64_t limit = ncclParamCodepathTraceLimit();
+  if (limit < 0) return true;
+  uint64_t sample = ncclCodepathTraceCount.fetch_add(1, std::memory_order_relaxed);
+  return sample < (uint64_t)limit;
 }
 
 static inline bool ncclIbMeasureSendTrackingEnabled() {
@@ -2653,6 +2668,22 @@ ncclResult_t ncclIbMultiSend(struct ncclIbSendComm* comm, int slot) {
   uint64_t measurePostStartNs = 0;
   uint64_t measurePostDoneNs = 0;
   bool measureSend = ncclIbMeasureSendTrackingEnabled();
+  if (ncclCodepathTraceTake()) {
+    uint64_t totalBytes = 0;
+    int minBytes = nreqs == 0 ? 0 : reqs[0]->send.size;
+    int maxBytes = 0;
+    for (int r=0; r<nreqs; r++) {
+      int size = reqs[r]->send.size;
+      totalBytes += (uint64_t)size;
+      if (size < minBytes) minBytes = size;
+      if (size > maxBytes) maxBytes = size;
+    }
+    INFO(NCCL_NET,
+         "NCCL CODEPATH ib_multisend slot=%d nreqs=%d totalBytes=%llu minBytes=%d maxBytes=%d nqps=%d nDataQps=%d splitDataOnQps=%lld ar=%d devIndex=%d nRemDevs=%d vNDevs=%d ready=%d",
+         slot, nreqs, (unsigned long long)totalBytes, minBytes, maxBytes, nqps, comm->base.nDataQps,
+         (long long)ncclParamIbSplitDataOnQps(), comm->ar, comm->base.devIndex, comm->base.nRemDevs,
+         comm->base.vProps.ndevs, comm->base.ready);
+  }
   for (int i = 0; i < nqps; i++) {
     int qpIndex = comm->base.qpIndex;
     ncclIbQp* qp = comm->base.qps + qpIndex;

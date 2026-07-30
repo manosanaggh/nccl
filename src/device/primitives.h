@@ -19,13 +19,28 @@
 #endif
 
 #if NCCL_DEVICE_MEASURE_RING_PRIMS
-#define NCCL_RING_PRIM_STATS_STAGING_COUNT 0
-#define NCCL_RING_PRIM_STATS_STAGING_BYTES 1
-#define NCCL_RING_PRIM_STATS_STAGING_NS 2
-#define NCCL_RING_PRIM_STATS_LEN 3
-#define NCCL_RING_PRIM_MEASURE_START(_tid) 0ULL
-#define NCCL_RING_PRIM_MEASURE_END_IF(_enabled, _tid, _coll, _prim, _elemOffset, _chunkCount, _nelem, _typeSize, _start) do {} while (0)
-#define NCCL_RING_PRIM_MEASURE_END(_tid, _coll, _prim, _elemOffset, _chunkCount, _nelem, _typeSize, _start) do {} while (0)
+#define NCCL_RING_PRIM_MEASURE_START(_tid) \
+  (((_tid) == 0 && ncclShmem.comm.measureRingPrims && ncclShmem.comm.measureRingPrimsStats != nullptr) ? globaltimer() : 0ULL)
+#define NCCL_RING_PRIM_MEASURE_END_IF(_net, _tid, _primId, _elemOffset, _chunkCount, _nelem, _typeSize, _start) do { \
+  if ((_tid) == 0 && ncclShmem.comm.measureRingPrims && ncclShmem.comm.measureRingPrimsStats != nullptr && (_start) != 0ULL) { \
+    unsigned long long __ncclRingPrimBytes = (unsigned long long)(_nelem) * (unsigned long long)(_typeSize); \
+    if (__ncclRingPrimBytes >= ncclShmem.comm.measureRingPrimsMinBytes) { \
+      unsigned long long __ncclRingPrimEnd = globaltimer(); \
+      int __ncclRingPrimBase = NCCL_RING_PRIM_STATS_PRIM_BASE + ((int)(_primId)) * NCCL_RING_PRIM_STATS_PRIM_FIELDS; \
+      unsigned long long __ncclRingPrimNs = __ncclRingPrimEnd - (unsigned long long)(_start); \
+      atomicAdd((unsigned long long*)(ncclShmem.comm.measureRingPrimsStats + __ncclRingPrimBase + NCCL_RING_PRIM_STATS_PRIM_COUNT), 1ULL); \
+      atomicAdd((unsigned long long*)(ncclShmem.comm.measureRingPrimsStats + __ncclRingPrimBase + NCCL_RING_PRIM_STATS_PRIM_BYTES), __ncclRingPrimBytes); \
+      atomicAdd((unsigned long long*)(ncclShmem.comm.measureRingPrimsStats + __ncclRingPrimBase + NCCL_RING_PRIM_STATS_PRIM_NS), __ncclRingPrimNs); \
+      if (_net) { \
+        atomicAdd((unsigned long long*)(ncclShmem.comm.measureRingPrimsStats + __ncclRingPrimBase + NCCL_RING_PRIM_STATS_PRIM_NET_COUNT), 1ULL); \
+        atomicAdd((unsigned long long*)(ncclShmem.comm.measureRingPrimsStats + __ncclRingPrimBase + NCCL_RING_PRIM_STATS_PRIM_NET_BYTES), __ncclRingPrimBytes); \
+        atomicAdd((unsigned long long*)(ncclShmem.comm.measureRingPrimsStats + __ncclRingPrimBase + NCCL_RING_PRIM_STATS_PRIM_NET_NS), __ncclRingPrimNs); \
+      } \
+    } \
+  } \
+} while (0)
+#define NCCL_RING_PRIM_MEASURE_END(_tid, _primId, _elemOffset, _chunkCount, _nelem, _typeSize, _start) \
+  NCCL_RING_PRIM_MEASURE_END_IF(0, _tid, _primId, _elemOffset, _chunkCount, _nelem, _typeSize, _start)
 #define NCCL_RING_IB_STAGING_COPY_MEASURE_START(_enabled, _tid) \
   (((_enabled) && (_tid) == 0 && ncclShmem.comm.measureRingPrims && ncclShmem.comm.measureRingPrimsStats != nullptr) ? globaltimer() : 0ULL)
 #define NCCL_RING_IB_STAGING_COPY_MEASURE_END(_enabled, _tid, _prim, _nelem, _typeSize, _start) do { \
@@ -41,8 +56,8 @@
 } while (0)
 #else
 #define NCCL_RING_PRIM_MEASURE_START(_tid) 0ULL
-#define NCCL_RING_PRIM_MEASURE_END_IF(_enabled, _tid, _coll, _prim, _elemOffset, _chunkCount, _nelem, _typeSize, _start) do {} while (0)
-#define NCCL_RING_PRIM_MEASURE_END(_tid, _coll, _prim, _elemOffset, _chunkCount, _nelem, _typeSize, _start) do {} while (0)
+#define NCCL_RING_PRIM_MEASURE_END_IF(_net, _tid, _primId, _elemOffset, _chunkCount, _nelem, _typeSize, _start) do {} while (0)
+#define NCCL_RING_PRIM_MEASURE_END(_tid, _primId, _elemOffset, _chunkCount, _nelem, _typeSize, _start) do {} while (0)
 #define NCCL_RING_IB_STAGING_COPY_MEASURE_START(_enabled, _tid) 0ULL
 #define NCCL_RING_IB_STAGING_COPY_MEASURE_END(_enabled, _tid, _prim, _nelem, _typeSize, _start) do {} while (0)
 #endif

@@ -22,6 +22,7 @@
 #include "mnnvl.h"
 #include <fcntl.h>
 #include <string.h>
+#include <stdio.h>
 #include <errno.h>
 #include <assert.h>
 #include <dlfcn.h>
@@ -356,23 +357,65 @@ NCCL_PARAM(DeviceMeasureRingPrimsMinBytes, "DEVICE_MEASURE_RING_PRIMS_MIN_BYTES"
 
 static std::mutex ncclRingIbStagingCopySummaryMutex;
 static uint64_t ncclRingIbStagingCopySummaryComms = 0;
-static uint64_t ncclRingIbStagingCopySummaryCount = 0;
-static uint64_t ncclRingIbStagingCopySummaryBytes = 0;
-static uint64_t ncclRingIbStagingCopySummaryNs = 0;
+static uint64_t ncclRingIbStagingCopySummaryStats[NCCL_RING_PRIM_STATS_LEN] = {0};
+
+static const char* ncclRingPrimMeasureName(int prim) {
+  static const char* names[NCCL_RING_PRIM_STATS_NUM_PRIMS] = {
+    "ag_ds",
+    "ag_dcs",
+    "ag_drcds",
+    "ag_dr",
+    "ag_lrc",
+    "rs_s",
+    "rs_rrs",
+    "rs_rrc"
+  };
+  return prim >= 0 && prim < NCCL_RING_PRIM_STATS_NUM_PRIMS ? names[prim] : "unknown";
+}
 
 static void ncclRingIbStagingCopySummary() __attribute__((destructor));
 static void ncclRingIbStagingCopySummary() {
   if (!ncclParamDeviceMeasureRingPrims()) return;
   std::lock_guard<std::mutex> lock(ncclRingIbStagingCopySummaryMutex);
-  double totalS = (double)ncclRingIbStagingCopySummaryNs / 1000000000.0;
-  double avgUs = ncclRingIbStagingCopySummaryCount == 0 ? 0.0 :
-      (double)ncclRingIbStagingCopySummaryNs / (double)ncclRingIbStagingCopySummaryCount / 1000.0;
+  uint64_t stagingCount = ncclRingIbStagingCopySummaryStats[NCCL_RING_PRIM_STATS_STAGING_COUNT];
+  uint64_t stagingBytes = ncclRingIbStagingCopySummaryStats[NCCL_RING_PRIM_STATS_STAGING_BYTES];
+  uint64_t stagingNs = ncclRingIbStagingCopySummaryStats[NCCL_RING_PRIM_STATS_STAGING_NS];
+  double totalS = (double)stagingNs / 1000000000.0;
+  double avgUs = stagingCount == 0 ? 0.0 : (double)stagingNs / (double)stagingCount / 1000.0;
+
+  char primSummary[4096];
+  size_t pos = 0;
+  primSummary[0] = '\0';
+  for (int prim = 0; prim < NCCL_RING_PRIM_STATS_NUM_PRIMS; prim++) {
+    int base = NCCL_RING_PRIM_STATS_PRIM_BASE + prim * NCCL_RING_PRIM_STATS_PRIM_FIELDS;
+    uint64_t count = ncclRingIbStagingCopySummaryStats[base + NCCL_RING_PRIM_STATS_PRIM_COUNT];
+    uint64_t bytes = ncclRingIbStagingCopySummaryStats[base + NCCL_RING_PRIM_STATS_PRIM_BYTES];
+    uint64_t ns = ncclRingIbStagingCopySummaryStats[base + NCCL_RING_PRIM_STATS_PRIM_NS];
+    uint64_t netCount = ncclRingIbStagingCopySummaryStats[base + NCCL_RING_PRIM_STATS_PRIM_NET_COUNT];
+    uint64_t netBytes = ncclRingIbStagingCopySummaryStats[base + NCCL_RING_PRIM_STATS_PRIM_NET_BYTES];
+    uint64_t netNs = ncclRingIbStagingCopySummaryStats[base + NCCL_RING_PRIM_STATS_PRIM_NET_NS];
+    if (count == 0 && netCount == 0) continue;
+    const char* name = ncclRingPrimMeasureName(prim);
+    int written = snprintf(primSummary + pos, sizeof(primSummary) - pos,
+        " %s={c=%llu,b=%llu,ns=%llu,avg_us=%.3f,nc=%llu,nb=%llu,nns=%llu,navg_us=%.3f}",
+        name, (unsigned long long)count, (unsigned long long)bytes, (unsigned long long)ns,
+        count == 0 ? 0.0 : (double)ns / (double)count / 1000.0,
+        (unsigned long long)netCount, (unsigned long long)netBytes, (unsigned long long)netNs,
+        netCount == 0 ? 0.0 : (double)netNs / (double)netCount / 1000.0);
+    if (written < 0) break;
+    if ((size_t)written >= sizeof(primSummary) - pos) {
+      pos = sizeof(primSummary) - 1;
+      break;
+    }
+    pos += (size_t)written;
+  }
+
   INFO(NCCL_NET,
-       "RING_IB_STAGING_COPY summary comms=%llu count=%llu bytes=%llu total_time_ns=%llu total_time_s=%.6f avg_us=%.3f",
+       "RING_IB_STAGING_COPY summary comms=%llu count=%llu bytes=%llu total_time_ns=%llu total_time_s=%.6f avg_us=%.3f ring_prim_path=1%s",
        (unsigned long long)ncclRingIbStagingCopySummaryComms,
-       (unsigned long long)ncclRingIbStagingCopySummaryCount,
-       (unsigned long long)ncclRingIbStagingCopySummaryBytes,
-       (unsigned long long)ncclRingIbStagingCopySummaryNs, totalS, avgUs);
+       (unsigned long long)stagingCount,
+       (unsigned long long)stagingBytes,
+       (unsigned long long)stagingNs, totalS, avgUs, primSummary);
 }
 
 // Detect DMA-BUF support
@@ -551,7 +594,7 @@ static ncclResult_t devCommSetup(ncclComm_t comm) {
   tmpCommAndChans.comm.measureRingPrimsStats = NULL;
   comm->measureRingPrimsStats = NULL;
   if (tmpCommAndChans.comm.measureRingPrims) {
-    NCCLCHECKGOTO(ncclCudaCallocAsync(&comm->measureRingPrimsStats, 3, deviceStream), ret, fail);
+    NCCLCHECKGOTO(ncclCudaCallocAsync(&comm->measureRingPrimsStats, NCCL_RING_PRIM_STATS_LEN, deviceStream), ret, fail);
     ncclCommPushCudaFree(comm, comm->measureRingPrimsStats);
     tmpCommAndChans.comm.measureRingPrimsStats = comm->measureRingPrimsStats;
   }
@@ -2261,13 +2304,11 @@ static ncclResult_t commDestroySync(struct ncclAsyncJob* job_) {
     }
 
     if (comm->measureRingPrimsStats != NULL) {
-      uint64_t ringPrimStats[3] = {0, 0, 0};
-      CUDACHECKGOTO(cudaMemcpy(ringPrimStats, comm->measureRingPrimsStats, 3 * sizeof(uint64_t), cudaMemcpyDeviceToHost), ret, fail);
+      uint64_t ringPrimStats[NCCL_RING_PRIM_STATS_LEN] = {0};
+      CUDACHECKGOTO(cudaMemcpy(ringPrimStats, comm->measureRingPrimsStats, NCCL_RING_PRIM_STATS_LEN * sizeof(uint64_t), cudaMemcpyDeviceToHost), ret, fail);
       std::lock_guard<std::mutex> lock(ncclRingIbStagingCopySummaryMutex);
       ncclRingIbStagingCopySummaryComms++;
-      ncclRingIbStagingCopySummaryCount += ringPrimStats[0];
-      ncclRingIbStagingCopySummaryBytes += ringPrimStats[1];
-      ncclRingIbStagingCopySummaryNs += ringPrimStats[2];
+      for (int i = 0; i < NCCL_RING_PRIM_STATS_LEN; i++) ncclRingIbStagingCopySummaryStats[i] += ringPrimStats[i];
     }
 
     NCCLCHECKGOTO(ncclCommPollEventCallbacks(comm, true), ret, fail);

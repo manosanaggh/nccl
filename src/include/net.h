@@ -35,5 +35,7 @@ extern ncclGin_t ncclGinIbProxy;
 bool ncclIbMeasureSendKernelOverlapEnabled();
 void ncclIbMeasureKernelActiveStart();
 void ncclIbMeasureKernelActiveEnd();
+bool ncclCodepathTraceEnabled();
+bool ncclCodepathTraceTake();
 
 #endif

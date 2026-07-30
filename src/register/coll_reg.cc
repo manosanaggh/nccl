@@ -9,6 +9,8 @@
 #include "enqueue.h"
 #include "register_inline.h"
 #include "param.h"
+#include "collectives.h"
+#include "net.h"
 
 NCCL_PARAM(RegLogRingNetSkip, "REG_LOG_RING_NET_SKIP", 0);
 
@@ -124,6 +126,9 @@ ncclResult_t ncclRegisterCollBuffers(
 
   info->regBufType = NCCL_REGULAR_BUFFER;
   *regNeedConnect = true;
+  size_t codepathElementSize = ncclTypeSize(info->datatype);
+  size_t codepathSendSize = codepathElementSize*ncclFuncSendCount(info->func, comm->nRanks, info->count);
+  size_t codepathRecvSize = codepathElementSize*ncclFuncRecvCount(info->func, comm->nRanks, info->count);
   if (!(ncclParamLocalRegister() || (comm->planner.persistent && ncclParamGraphRegister()))) goto exit;
 #if CUDART_VERSION >= 11030
   if (info->algorithm == NCCL_ALGO_NVLS || info->algorithm == NCCL_ALGO_NVLS_TREE) {
@@ -477,6 +482,14 @@ ncclResult_t ncclRegisterCollBuffers(
     }
   }
 exit:
+  if (ncclCodepathTraceTake()) {
+    INFO(NCCL_REG,
+         "NCCL CODEPATH reg rank=%d func=%s algo=%s proto=%s sendSize=%zu recvSize=%zu regBufType=%d regNeedConnect=%d localRegister=%lld graphRegister=%lld persistent=%d nCleanup=%d sendMhandle=%p recvMhandle=%p sendNetHandles=%p recvNetHandles=%p srecvNetHandles=%p",
+         comm->rank, ncclFuncToString(info->func), ncclAlgoToString(info->algorithm), ncclProtoToString(info->protocol),
+         codepathSendSize, codepathRecvSize, info->regBufType, *regNeedConnect ? 1 : 0,
+         (long long)ncclParamLocalRegister(), (long long)ncclParamGraphRegister(), comm->planner.persistent ? 1 : 0,
+         info->nCleanupQueueElts, info->sendMhandle, info->recvMhandle, info->sendNetHandles, info->recvNetHandles, info->srecvNetHandles);
+  }
 #endif
   return result;
 }

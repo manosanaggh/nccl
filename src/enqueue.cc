@@ -742,6 +742,15 @@ static ncclResult_t scheduleCollTasksToPlan(
     // Profiler
     plan->groupApiEventHandle = task->groupApiEventHandle;
 
+    if (ncclCodepathTraceTake()) {
+      INFO(NCCL_COLL,
+           "NCCL CODEPATH coll rank=%d func=%s msgBytes=%zu trafficBytes=%zu algo=%s proto=%s devFuncId=%u nMaxChannels=%d nWarps=%d channelLo=%d channelHi=%d regBufType=%d regNeedConnect=%d isCollnet=%u isNvls=%u hasProxyOps=%d chunkSteps=%d sliceSteps=%d",
+           comm->rank, ncclFuncToString(task->func), task->count * ncclTypeSize(task->datatype), task->trafficBytes,
+           ncclAlgoToString(task->algorithm), ncclProtoToString(task->protocol), task->devFuncId, task->nMaxChannels,
+           task->nWarps, devWork->channelLo, devWork->channelHi, task->regBufType, regNeedConnect ? 1 : 0,
+           task->isCollnet, task->isNvls, plan->hasProxyOps ? 1 : 0, task->chunkSteps, task->sliceSteps);
+    }
+
     if (comm->rank == 0) {
       INFO(NCCL_TUNING, "%s: %ld Bytes -> Algo %s proto %s channel{Lo..Hi}={%d..%d}",
         ncclFuncToString(task->func), task->count * ncclTypeSize(task->datatype), ncclAlgoToString(task->algorithm),
@@ -1578,6 +1587,15 @@ ncclResult_t ncclLaunchKernel(struct ncclComm* comm, struct ncclKernelPlan* plan
   cudaStream_t launchStream = planner->streams->stream;
 
   NCCLCHECK(ncclProfilerStartKernelLaunchEvent(plan, launchStream));
+
+  if (ncclCodepathTraceTake()) {
+    INFO(NCCL_COLL,
+         "NCCL CODEPATH kernel_launch rank=%d plan=%p channels=%d channelMask=0x%llx threads=%d smem=%d workBytes=%zu collOpCount=%d nWorkBatches=%d hasProxyOps=%d persistent=%d isHostCbEnq=%d isSymColl=%d isCeColl=%d kernelSpecialized=%d stream=%p",
+         comm->rank, plan, nChannels, (unsigned long long)plan->channelMask, plan->threadPerBlock, smem,
+         plan->workBytes, plan->collOpCount, plan->nWorkBatches, plan->hasProxyOps ? 1 : 0,
+         plan->persistent ? 1 : 0, plan->isHostCbEnq ? 1 : 0, plan->isSymColl ? 1 : 0, plan->isCeColl ? 1 : 0,
+         plan->kernelSpecialized ? 1 : 0, launchStream);
+  }
 
   void* extra[] = {
     CU_LAUNCH_PARAM_BUFFER_POINTER, plan->kernelArgs,
@@ -2500,6 +2518,14 @@ static ncclResult_t collTaskAppend(
   t->eActivationMask = ncclProfilerApiState.eActivationMask;
   t->groupApiEventHandle = ncclProfilerApiState.groupApiEventHandle;
   t->collApiEventHandle = ncclProfilerApiState.collApiEventHandle;
+
+  if (ncclCodepathTraceTake()) {
+    INFO(NCCL_COLL,
+         "NCCL CODEPATH task_append rank=%d func=%s count=%zu datatype=%s elemBytes=%zu trafficBytes=%zu sendbuff=%p recvbuff=%p chunkSteps=%d sliceSteps=%d nRanks=%d nNodes=%d stream=%p",
+         comm->rank, ncclFuncToString(t->func), t->count, ncclDatatypeToString(t->datatype),
+         ncclTypeSize(t->datatype), t->trafficBytes, t->sendbuff, t->recvbuff, t->chunkSteps, t->sliceSteps,
+         comm->nRanks, comm->nNodes, info->stream);
+  }
 
   planner->nTasksColl += 1;
   ncclTaskCollSorterInsert(&planner->collSorter, t, t->trafficBytes);
