@@ -23,6 +23,7 @@ namespace {
     int workNthreads;
     T *inputBuf = (T*)work->sendbuff;
     T *outputBuf = (T*)work->recvbuff;
+    unsigned long long ringKernelStart = NCCL_RING_KERNEL_CHANNEL_MEASURE_START(tid);
 
     // If isNetOffload == true, we only use 1 warp to drive Ring algo/network communication
     // and the rest of warps proceed to copy src data into dst buffer in parallel when AG
@@ -91,6 +92,7 @@ namespace {
     // in this work. We use bar 14 to avoid conflicts with prims barrier and
     // __syncthread().
     if (isNetOffload) barrier_sync(14, nthreads);
+    NCCL_RING_KERNEL_CHANNEL_MEASURE_END(tid, ringKernelStart);
   }
 }
 

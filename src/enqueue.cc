@@ -1604,6 +1604,10 @@ ncclResult_t ncclLaunchKernel(struct ncclComm* comm, struct ncclKernelPlan* plan
     CU_LAUNCH_PARAM_END
   };
 
+  bool measureKernelOverlap = ncclIbMeasureSendKernelOverlapEnabled() && !ncclCudaGraphValid(planner->capturingGraph);
+  bool measureKernelActiveStarted = false;
+  bool measureKernelActiveEndQueued = false;
+
   int driverVersion;
   NCCLCHECKGOTO(ncclCudaDriverVersion(&driverVersion), ret, do_return);
 
@@ -1675,23 +1679,32 @@ ncclResult_t ncclLaunchKernel(struct ncclComm* comm, struct ncclKernelPlan* plan
     launchConfig.attrs = launchAttrs;
     launchConfig.numAttrs = attrs;
     launchConfig.hStream = launchStream;
+    if (measureKernelOverlap) {
+      ncclIbMeasureKernelActiveStart();
+      measureKernelActiveStarted = true;
+    }
     CUCHECKGOTO(cuLaunchKernelEx(&launchConfig, fn, nullptr, extra), ret, do_return);
   #endif
   } else {
     // Standard kernel launch
+    if (measureKernelOverlap) {
+      ncclIbMeasureKernelActiveStart();
+      measureKernelActiveStarted = true;
+    }
     CUCHECKGOTO(cuLaunchKernel(fn, grid.x, grid.y, grid.z, block.x, block.y, block.z, smem, launchStream, nullptr, extra), ret, do_return);
   }
 
-  if (ncclIbMeasureSendKernelOverlapEnabled() && !ncclCudaGraphValid(planner->capturingGraph)) {
-    ncclIbMeasureKernelActiveStart();
+  if (measureKernelOverlap) {
     cudaError_t cbStatus = cudaLaunchHostFunc(launchStream, ncclIbMeasureKernelActiveEndCallback, nullptr);
-    if (cbStatus != cudaSuccess) {
-      ncclIbMeasureKernelActiveEnd();
+    if (cbStatus == cudaSuccess) {
+      measureKernelActiveEndQueued = true;
+    } else {
       CUDACHECKGOTO(cbStatus, ret, do_return);
     }
   }
 
 do_return:
+  if (measureKernelActiveStarted && !measureKernelActiveEndQueued) ncclIbMeasureKernelActiveEnd();
   NCCLCHECK(ncclProfilerStopKernelLaunchEvent(plan));
   return ret;
 }

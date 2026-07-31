@@ -23,6 +23,7 @@ namespace {
     size_t dataOffset;
     uint32_t nelem;
     int rankDest;
+    unsigned long long ringKernelStart = NCCL_RING_KERNEL_CHANNEL_MEASURE_START(tid);
 
     // Coverity reports that the callee treats &ring->next as an array.  However, due to the use of
     // FanSymmetric<1>, only the first element is ever accessed, so it's fine.
@@ -65,6 +66,7 @@ namespace {
         NCCL_RING_PRIM_MEASURE_END_IF(0, tid, NCCL_RING_PRIM_RS_RECV_REDUCE_COPY, elemOffset, chunkCount, nelem, sizeof(T), primStart);
       }
     }
+    NCCL_RING_KERNEL_CHANNEL_MEASURE_END(tid, ringKernelStart);
   }
 }
 
