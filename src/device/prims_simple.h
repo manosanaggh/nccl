@@ -56,18 +56,22 @@ class Primitives<
 
   // Don't use barrier 0 as it's used by the final sync
   __device__ void barrier() {
+    unsigned long long syncStart = NCCL_RING_SYNC_MEASURE_START(tid == 0);
     if (nthreads == WARP_SIZE) __syncwarp();
     else {
       int bar = 15-group;
       barrier_sync(bar, nthreads);
     }
+    NCCL_RING_SYNC_MEASURE_END(tid == 0, NCCL_RING_SYNC_BARRIER, syncStart);
   }
   __device__ void subBarrier() {
+    unsigned long long syncStart = NCCL_RING_SYNC_MEASURE_START(tid == 0);
     if (nworkers == WARP_SIZE) __syncwarp();
     else {
       int bar = 15-group - (nworkers!=nthreads ? 1 : 0);
       barrier_sync(bar, nworkers);
     }
+    NCCL_RING_SYNC_MEASURE_END(tid == 0, NCCL_RING_SYNC_SUBBARRIER, syncStart);
   }
 
   // PAT uses a single barrier across all groups
@@ -111,12 +115,16 @@ class Primitives<
     // Yes, for some template arguments this code will be unreachable.  That's fine.
     // coverity[dead_error_line]
     if ((flags & (Recv * RoleWaitRecv)) || (flags & (Send * RoleWaitSend))) {
+      uint64_t waitGoal = step + StepPerSlice;
+      bool waitNeeded = connStepCache + (isSendNotRecv ? NCCL_STEPS : 0) < waitGoal;
+      unsigned long long syncStart = NCCL_RING_SYNC_MEASURE_START(waitNeeded);
       int spins = 0;
-      while (connStepCache + (isSendNotRecv ? NCCL_STEPS : 0) < step + StepPerSlice) {
+      while (connStepCache + (isSendNotRecv ? NCCL_STEPS : 0) < waitGoal) {
         connStepCache = loadStepValue(connStepPtr);
         if (checkAbort(flags, Aborted, spins)) break;
         //if (spins == 0) printf("r=%d b=%d t=%d SPUN OUT got=%d want=%d\n", ncclShmem.comm.rank, blockIdx.x, threadIdx.x, int(connStepCache + (isSendNotRecv ? NCCL_STEPS : 0)), int(step+StepPerSlice));
       }
+      NCCL_RING_SYNC_MEASURE_END(waitNeeded, isSendNotRecv ? NCCL_RING_SYNC_WAIT_SEND : NCCL_RING_SYNC_WAIT_RECV, syncStart);
     }
 
     if (flags & (Recv*RoleWaitRecv | Send*RoleWaitSend)) {
@@ -172,11 +180,15 @@ class Primitives<
   template<int Recv, int Send>
   inline __device__ void postPeer(bool dataStored) {
     if (flags & (Recv*RolePostRecv | Send*RolePostSend)) {
+      unsigned long long syncStart = NCCL_RING_SYNC_MEASURE_START(1);
       step += StepPerSlice;
       if (Send && (flags & RolePostSend) && (dataStored||(flags&ConnFifoEnabled))) {
+        unsigned long long fenceStart = NCCL_RING_SYNC_MEASURE_START(1);
         fence_acq_rel_sys();
+        NCCL_RING_SYNC_MEASURE_END(1, NCCL_RING_SYNC_POST_FENCE, fenceStart);
       }
       st_relaxed_sys_global(connStepPtr, step);
+      NCCL_RING_SYNC_MEASURE_END(1, NCCL_RING_SYNC_POST_PEER, syncStart);
     }
   }
 

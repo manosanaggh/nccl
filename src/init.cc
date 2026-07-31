@@ -373,6 +373,18 @@ static const char* ncclRingPrimMeasureName(int prim) {
   return prim >= 0 && prim < NCCL_RING_PRIM_STATS_NUM_PRIMS ? names[prim] : "unknown";
 }
 
+static const char* ncclRingSyncMeasureName(int sync) {
+  static const char* names[NCCL_RING_SYNC_NUM] = {
+    "wait_send",
+    "wait_recv",
+    "barrier",
+    "subbarrier",
+    "post_peer",
+    "post_fence"
+  };
+  return sync >= 0 && sync < NCCL_RING_SYNC_NUM ? names[sync] : "unknown";
+}
+
 static void ncclRingIbStagingCopySummary() __attribute__((destructor));
 static void ncclRingIbStagingCopySummary() {
   if (!ncclParamDeviceMeasureRingPrims()) return;
@@ -386,6 +398,28 @@ static void ncclRingIbStagingCopySummary() {
   double avgUs = stagingCount == 0 ? 0.0 : (double)stagingNs / (double)stagingCount / 1000.0;
   double kernelChannelS = (double)kernelChannelNs / 1000000000.0;
   double kernelChannelAvgMs = kernelChannelCount == 0 ? 0.0 : (double)kernelChannelNs / (double)kernelChannelCount / 1000000.0;
+
+  char syncSummary[2048];
+  size_t syncPos = 0;
+  syncSummary[0] = '\0';
+  for (int sync = 0; sync < NCCL_RING_SYNC_NUM; sync++) {
+    int base = NCCL_RING_PRIM_STATS_SYNC_BASE + sync * NCCL_RING_PRIM_STATS_SYNC_FIELDS;
+    uint64_t count = ncclRingIbStagingCopySummaryStats[base + NCCL_RING_PRIM_STATS_SYNC_COUNT];
+    uint64_t ns = ncclRingIbStagingCopySummaryStats[base + NCCL_RING_PRIM_STATS_SYNC_NS];
+    if (count == 0) continue;
+    const char* name = ncclRingSyncMeasureName(sync);
+    int written = snprintf(syncSummary + syncPos, sizeof(syncSummary) - syncPos,
+        " %s={c=%llu,ns=%llu,total_s=%.6f,avg_us=%.3f}",
+        name, (unsigned long long)count, (unsigned long long)ns,
+        (double)ns / 1000000000.0,
+        (double)ns / (double)count / 1000.0);
+    if (written < 0) break;
+    if ((size_t)written >= sizeof(syncSummary) - syncPos) {
+      syncPos = sizeof(syncSummary) - 1;
+      break;
+    }
+    syncPos += (size_t)written;
+  }
 
   char primSummary[4096];
   size_t pos = 0;
@@ -415,12 +449,12 @@ static void ncclRingIbStagingCopySummary() {
   }
 
   INFO(NCCL_NET,
-       "RING_IB_STAGING_COPY summary comms=%llu count=%llu bytes=%llu total_time_ns=%llu total_time_s=%.6f avg_us=%.3f device_kernel_channel_count=%llu device_kernel_channel_active_s=%.6f device_kernel_channel_avg_ms=%.3f ring_prim_path=1%s",
+       "RING_IB_STAGING_COPY summary comms=%llu count=%llu bytes=%llu total_time_ns=%llu total_time_s=%.6f avg_us=%.3f device_kernel_channel_count=%llu device_kernel_channel_active_s=%.6f device_kernel_channel_avg_ms=%.3f ring_sync_path=1%s ring_prim_path=1%s",
        (unsigned long long)ncclRingIbStagingCopySummaryComms,
        (unsigned long long)stagingCount,
        (unsigned long long)stagingBytes,
        (unsigned long long)stagingNs, totalS, avgUs,
-       (unsigned long long)kernelChannelCount, kernelChannelS, kernelChannelAvgMs, primSummary);
+       (unsigned long long)kernelChannelCount, kernelChannelS, kernelChannelAvgMs, syncSummary, primSummary);
 }
 
 // Detect DMA-BUF support
