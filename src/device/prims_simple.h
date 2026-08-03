@@ -53,6 +53,7 @@ class Primitives<
   int      connStepSize; // Connection step size
   void*    netDeviceHandle;
   uint64_t accSize;
+  struct ncclDevWorkColl* measureCollWork;
 
   // Don't use barrier 0 as it's used by the final sync
   __device__ void barrier() {
@@ -62,7 +63,7 @@ class Primitives<
       int bar = 15-group;
       barrier_sync(bar, nthreads);
     }
-    NCCL_RING_SYNC_MEASURE_END(tid == 0, NCCL_RING_SYNC_BARRIER, syncStart);
+    NCCL_RING_SYNC_MEASURE_END(tid == 0, NCCL_RING_SYNC_BARRIER, syncStart, measureCollWork);
   }
   __device__ void subBarrier() {
     unsigned long long syncStart = NCCL_RING_SYNC_MEASURE_START(tid == 0);
@@ -71,7 +72,7 @@ class Primitives<
       int bar = 15-group - (nworkers!=nthreads ? 1 : 0);
       barrier_sync(bar, nworkers);
     }
-    NCCL_RING_SYNC_MEASURE_END(tid == 0, NCCL_RING_SYNC_SUBBARRIER, syncStart);
+    NCCL_RING_SYNC_MEASURE_END(tid == 0, NCCL_RING_SYNC_SUBBARRIER, syncStart, measureCollWork);
   }
 
   // PAT uses a single barrier across all groups
@@ -124,7 +125,7 @@ class Primitives<
         if (checkAbort(flags, Aborted, spins)) break;
         //if (spins == 0) printf("r=%d b=%d t=%d SPUN OUT got=%d want=%d\n", ncclShmem.comm.rank, blockIdx.x, threadIdx.x, int(connStepCache + (isSendNotRecv ? NCCL_STEPS : 0)), int(step+StepPerSlice));
       }
-      NCCL_RING_SYNC_MEASURE_END(waitNeeded, isSendNotRecv ? NCCL_RING_SYNC_WAIT_SEND : NCCL_RING_SYNC_WAIT_RECV, syncStart);
+      NCCL_RING_SYNC_MEASURE_END(waitNeeded, isSendNotRecv ? NCCL_RING_SYNC_WAIT_SEND : NCCL_RING_SYNC_WAIT_RECV, syncStart, measureCollWork);
     }
 
     if (flags & (Recv*RoleWaitRecv | Send*RoleWaitSend)) {
@@ -185,10 +186,10 @@ class Primitives<
       if (Send && (flags & RolePostSend) && (dataStored||(flags&ConnFifoEnabled))) {
         unsigned long long fenceStart = NCCL_RING_SYNC_MEASURE_START(1);
         fence_acq_rel_sys();
-        NCCL_RING_SYNC_MEASURE_END(1, NCCL_RING_SYNC_POST_FENCE, fenceStart);
+        NCCL_RING_SYNC_MEASURE_END(1, NCCL_RING_SYNC_POST_FENCE, fenceStart, measureCollWork);
       }
       st_relaxed_sys_global(connStepPtr, step);
-      NCCL_RING_SYNC_MEASURE_END(1, NCCL_RING_SYNC_POST_PEER, syncStart);
+      NCCL_RING_SYNC_MEASURE_END(1, NCCL_RING_SYNC_POST_PEER, syncStart, measureCollWork);
     }
   }
 
@@ -282,7 +283,7 @@ class Primitives<
                1, ncclShmem.groups[group].srcs,
                fan.nsend(), ncclShmem.groups[group].dsts+1,
                workSize);
-            NCCL_RING_IB_STAGING_COPY_MEASURE_END(measureIbStagingCopy, tid, primName, workSize, sizeof(T), stagingCopyStart);
+            NCCL_RING_IB_STAGING_COPY_MEASURE_END(measureIbStagingCopy, tid, primName, workSize, sizeof(T), stagingCopyStart, measureCollWork);
           }
         } else if (DirectSend && !DirectRecv && SrcBuf != Input && ncclShmem.groups[group].dsts[Dst] == nullptr) {
           // For broadcast in CollNet to do empty send
@@ -292,7 +293,7 @@ class Primitives<
              Recv, ncclShmem.groups[group].srcs,
              Dst, ncclShmem.groups[group].dsts,
              workSize);
-          NCCL_RING_IB_STAGING_COPY_MEASURE_END(measureIbStagingCopy, tid, primName, workSize, sizeof(T), stagingCopyStart);
+          NCCL_RING_IB_STAGING_COPY_MEASURE_END(measureIbStagingCopy, tid, primName, workSize, sizeof(T), stagingCopyStart, measureCollWork);
         } else if (ncclShmem.groups[group].srcs[0] && ncclShmem.groups[group].dsts[0]) {
           constexpr int PreOpSrcs = SrcBuf != Input ? 0 :
                                     DirectRecv*MaxRecv == NCCL_MAX_DIRECT_ARITY ? (1+NCCL_MAX_DIRECT_ARITY) : 1;
@@ -306,7 +307,7 @@ class Primitives<
                 Recv * fan.nrecv() + Src, ncclShmem.groups[group].srcs,
                 1, ncclShmem.groups[group].dsts,
                 workSize);
-            NCCL_RING_IB_STAGING_COPY_MEASURE_END(measureIbStagingCopy, tid, primName, workSize, sizeof(T), stagingCopyStart);
+            NCCL_RING_IB_STAGING_COPY_MEASURE_END(measureIbStagingCopy, tid, primName, workSize, sizeof(T), stagingCopyStart, measureCollWork);
           } else {
             unsigned long long stagingCopyStart = NCCL_RING_IB_STAGING_COPY_MEASURE_START(measureIbStagingCopy, tid);
             reduceCopy<Unroll, RedOp, T,
@@ -316,7 +317,7 @@ class Primitives<
                 Recv * fan.nrecv() + Src, ncclShmem.groups[group].srcs,
                 Send * fan.nsend() + Dst, ncclShmem.groups[group].dsts,
                 workSize);
-            NCCL_RING_IB_STAGING_COPY_MEASURE_END(measureIbStagingCopy, tid, primName, workSize, sizeof(T), stagingCopyStart);
+            NCCL_RING_IB_STAGING_COPY_MEASURE_END(measureIbStagingCopy, tid, primName, workSize, sizeof(T), stagingCopyStart, measureCollWork);
           }
         } else {
           // we will come here when calling prims.directSend with net peer,
@@ -621,7 +622,8 @@ private:
       struct ncclDevWorkP2p* p2pWork = nullptr, int stepSize_ = 0, int mode = primsModeDefault
     ):
     tid(tid), nthreads(nthreads), tidInBlock(threadIdx.x), group(group),
-    stepSize(stepSize_ == 0 ? ncclShmem.comm.buffSizes[NCCL_PROTO_SIMPLE]/NCCL_STEPS/sizeof(T) : stepSize_) {
+    stepSize(stepSize_ == 0 ? ncclShmem.comm.buffSizes[NCCL_PROTO_SIMPLE]/NCCL_STEPS/sizeof(T) : stepSize_),
+    measureCollWork(collWork) {
 
     int peer = -1;
     flags = 0;

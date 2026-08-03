@@ -520,6 +520,81 @@ static void ncclRingIbStagingCopySummary() {
   INFO(NCCL_NET, "RING_SYNC summary ring_sync_path=1%s", syncSummary);
   INFO(NCCL_NET, "RING_SYNC_CHANNEL summary ring_sync_channel_path=1%s", syncChannelSummary);
   INFO(NCCL_NET, "RING_PRIM summary ring_prim_path=1%s", primSummary);
+
+
+  for (int slot = 0; slot < NCCL_RING_PRIM_OP_STATS_MAX; slot++) {
+    int metaBase = NCCL_RING_PRIM_OP_META_BASE + slot * NCCL_RING_PRIM_OP_META_FIELDS;
+    uint64_t valid = ncclRingIbStagingCopySummaryStats[metaBase + NCCL_RING_PRIM_OP_META_VALID];
+    if (valid == 0) continue;
+    uint64_t func = ncclRingIbStagingCopySummaryStats[metaBase + NCCL_RING_PRIM_OP_META_FUNC];
+    uint64_t bytes = ncclRingIbStagingCopySummaryStats[metaBase + NCCL_RING_PRIM_OP_META_BYTES];
+    uint64_t channelLo = ncclRingIbStagingCopySummaryStats[metaBase + NCCL_RING_PRIM_OP_META_CHANNEL_LO];
+    uint64_t channelHi = ncclRingIbStagingCopySummaryStats[metaBase + NCCL_RING_PRIM_OP_META_CHANNEL_HI];
+
+    uint64_t stagingOpCount = 0;
+    uint64_t stagingOpBytes = 0;
+    uint64_t stagingOpSumNs = 0;
+    uint64_t stagingOpMaxNs = 0;
+    int stagingOpActiveChannels = 0;
+    for (int channel = 0; channel < MAXCHANNELS; channel++) {
+      int base = NCCL_RING_PRIM_OP_STAGING_CHANNEL_BASE + slot * MAXCHANNELS * NCCL_RING_PRIM_OP_STAGING_CHANNEL_STRIDE + channel * NCCL_RING_PRIM_OP_STAGING_CHANNEL_STRIDE;
+      uint64_t count = ncclRingIbStagingCopySummaryStats[base + NCCL_RING_PRIM_STATS_STAGING_COUNT];
+      uint64_t chBytes = ncclRingIbStagingCopySummaryStats[base + NCCL_RING_PRIM_STATS_STAGING_BYTES];
+      uint64_t ns = ncclRingIbStagingCopySummaryStats[base + NCCL_RING_PRIM_STATS_STAGING_NS];
+      if (count == 0) continue;
+      stagingOpActiveChannels++;
+      stagingOpCount += count;
+      stagingOpBytes += chBytes;
+      stagingOpSumNs += ns;
+      if (ns > stagingOpMaxNs) stagingOpMaxNs = ns;
+    }
+
+    char opSyncSummary[2048];
+    size_t opSyncPos = 0;
+    opSyncSummary[0] = '\0';
+    for (int sync = 0; sync < NCCL_RING_SYNC_NUM; sync++) {
+      uint64_t sumCount = 0;
+      uint64_t sumNs = 0;
+      uint64_t maxNs = 0;
+      int activeChannels = 0;
+      for (int channel = 0; channel < MAXCHANNELS; channel++) {
+        int base = NCCL_RING_PRIM_OP_SYNC_CHANNEL_BASE + slot * MAXCHANNELS * NCCL_RING_PRIM_OP_SYNC_CHANNEL_STRIDE + channel * NCCL_RING_PRIM_OP_SYNC_CHANNEL_STRIDE + sync * NCCL_RING_PRIM_STATS_SYNC_FIELDS;
+        uint64_t count = ncclRingIbStagingCopySummaryStats[base + NCCL_RING_PRIM_STATS_SYNC_COUNT];
+        uint64_t ns = ncclRingIbStagingCopySummaryStats[base + NCCL_RING_PRIM_STATS_SYNC_NS];
+        if (count == 0) continue;
+        activeChannels++;
+        sumCount += count;
+        sumNs += ns;
+        if (ns > maxNs) maxNs = ns;
+      }
+      if (activeChannels == 0) continue;
+      const char* name = ncclRingSyncMeasureName(sync);
+      int written = snprintf(opSyncSummary + opSyncPos, sizeof(opSyncSummary) - opSyncPos,
+          " %s={active=%d,c=%llu,sum_s=%.6f,avg_ch_s=%.6f,max_ch_s=%.6f,avg_us=%.3f}",
+          name, activeChannels, (unsigned long long)sumCount,
+          (double)sumNs / 1000000000.0,
+          (double)sumNs / (double)activeChannels / 1000000000.0,
+          (double)maxNs / 1000000000.0,
+          sumCount == 0 ? 0.0 : (double)sumNs / (double)sumCount / 1000.0);
+      if (written < 0) break;
+      if ((size_t)written >= sizeof(opSyncSummary) - opSyncPos) {
+        opSyncPos = sizeof(opSyncSummary) - 1;
+        break;
+      }
+      opSyncPos += (size_t)written;
+    }
+
+    INFO(NCCL_NET,
+         "RING_OP summary op_slot=%d func=%s msg_bytes=%llu channelLo=%llu channelHi=%llu staging={active=%d,c=%llu,bytes=%llu,sum_s=%.6f,avg_ch_s=%.6f,max_ch_s=%.6f,avg_us=%.3f}%s",
+         slot, func < NCCL_NUM_FUNCTIONS ? ncclFuncStr[func] : "Unknown", (unsigned long long)bytes,
+         (unsigned long long)channelLo, (unsigned long long)channelHi,
+         stagingOpActiveChannels, (unsigned long long)stagingOpCount, (unsigned long long)stagingOpBytes,
+         (double)stagingOpSumNs / 1000000000.0,
+         stagingOpActiveChannels == 0 ? 0.0 : (double)stagingOpSumNs / (double)stagingOpActiveChannels / 1000000000.0,
+         (double)stagingOpMaxNs / 1000000000.0,
+         stagingOpCount == 0 ? 0.0 : (double)stagingOpSumNs / (double)stagingOpCount / 1000.0,
+         opSyncSummary);
+  }
 }
 
 // Detect DMA-BUF support
@@ -2408,11 +2483,15 @@ static ncclResult_t commDestroySync(struct ncclAsyncJob* job_) {
     }
 
     if (comm->measureRingPrimsStats != NULL) {
-      uint64_t ringPrimStats[NCCL_RING_PRIM_STATS_LEN] = {0};
+      uint64_t* ringPrimStats = NULL;
+      NCCLCHECKGOTO(ncclCalloc(&ringPrimStats, NCCL_RING_PRIM_STATS_LEN), ret, fail);
       CUDACHECKGOTO(cudaMemcpy(ringPrimStats, comm->measureRingPrimsStats, NCCL_RING_PRIM_STATS_LEN * sizeof(uint64_t), cudaMemcpyDeviceToHost), ret, fail);
-      std::lock_guard<std::mutex> lock(ncclRingIbStagingCopySummaryMutex);
-      ncclRingIbStagingCopySummaryComms++;
-      for (int i = 0; i < NCCL_RING_PRIM_STATS_LEN; i++) ncclRingIbStagingCopySummaryStats[i] += ringPrimStats[i];
+      {
+        std::lock_guard<std::mutex> lock(ncclRingIbStagingCopySummaryMutex);
+        ncclRingIbStagingCopySummaryComms++;
+        for (int i = 0; i < NCCL_RING_PRIM_STATS_LEN; i++) ncclRingIbStagingCopySummaryStats[i] += ringPrimStats[i];
+      }
+      free(ringPrimStats);
     }
 
     NCCLCHECKGOTO(ncclCommPollEventCallbacks(comm, true), ret, fail);

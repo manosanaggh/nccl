@@ -66,7 +66,7 @@ namespace {
         NCCL_RING_PRIM_MEASURE_END_IF(0, tid, NCCL_RING_PRIM_RS_RECV_REDUCE_COPY, elemOffset, chunkCount, nelem, sizeof(T), primStart);
       }
     }
-    NCCL_RING_KERNEL_CHANNEL_MEASURE_END(tid, ringKernelStart);
+    NCCL_RING_KERNEL_CHANNEL_MEASURE_END(tid, ringKernelStart, work);
   }
 }
 

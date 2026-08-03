@@ -92,7 +92,7 @@ namespace {
     // in this work. We use bar 14 to avoid conflicts with prims barrier and
     // __syncthread().
     if (isNetOffload) barrier_sync(14, nthreads);
-    NCCL_RING_KERNEL_CHANNEL_MEASURE_END(tid, ringKernelStart);
+    NCCL_RING_KERNEL_CHANNEL_MEASURE_END(tid, ringKernelStart, work);
   }
 }
 

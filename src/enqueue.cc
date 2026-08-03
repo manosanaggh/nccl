@@ -22,8 +22,12 @@
 #include <cstring> // std::memcpy
 #include <cinttypes> // PRIx64
 #include <cassert>
+#include <atomic>
 
 NCCL_PARAM(L1SharedMemoryCarveout, "L1_SHARED_MEMORY_CARVEOUT", 0);
+extern int64_t ncclParamDeviceMeasureRingPrims();
+
+static std::atomic<uint64_t> ncclRingPrimMeasureOpSlot{0};
 
 static void CUDART_CB ncclIbMeasureKernelActiveEndCallback(void*) {
   ncclIbMeasureKernelActiveEnd();
@@ -184,8 +188,12 @@ static void addWorkBatchToPlan(
   }
 }
 
+static void assignRingPrimOpSlots(struct ncclKernelPlan* plan);
+
 static void finishPlan(struct ncclComm* comm, struct ncclKernelPlan* plan) {
   ncclKernelPlanner::WipPlan::Channel* wipChannels = comm->planner.wipPlan.channels;
+  if (ncclParamDeviceMeasureRingPrims() != 0) assignRingPrimOpSlots(plan);
+
   size_t workBytes = plan->workBytes;
   size_t batchBytes = plan->nWorkBatches*sizeof(struct ncclDevWorkBatch);
 
@@ -318,6 +326,9 @@ ncclResult_t ncclTasksRegAndEnqueue(struct ncclComm* comm) {
     devWork.oneNode = (comm->nNodes == 1);
     devWork.isOneRPN = comm->isOneRPN;
     devWork.netRegUsed = devWork.regUsed = 0;
+    devWork.measureOpSlot = NCCL_RING_PRIM_OP_STATS_MAX;
+    devWork.measureFunc = (uint32_t)task->func;
+    devWork.measureCollBytes = task->count * ncclTypeSize(task->datatype);
     devWork.profilerEnabled = ncclProfilerPluginLoaded() && (task->eActivationMask & ncclProfileKernelCh);
     if (task->regBufType & NCCL_NET_REG_BUFFER)
       devWork.netRegUsed = 1;
@@ -481,6 +492,9 @@ ncclResult_t ncclPrepareTasks(struct ncclComm* comm, bool* algoNeedConnect, bool
       devWork.redOpArgIsPtr = task->opDev.scalarArgIsPtr;
       devWork.oneNode = (comm->nNodes == 1);
       devWork.netRegUsed = devWork.regUsed = 0;
+      devWork.measureOpSlot = NCCL_RING_PRIM_OP_STATS_MAX;
+      devWork.measureFunc = (uint32_t)task->func;
+      devWork.measureCollBytes = task->count * ncclTypeSize(task->datatype);
       devWork.profilerEnabled = ncclProfilerPluginLoaded() && (task->eActivationMask & ncclProfileKernelCh);
       if (task->regBufType & NCCL_NET_REG_BUFFER)
         devWork.netRegUsed = 1;
@@ -1275,6 +1289,21 @@ static ncclResult_t uploadWork(struct ncclComm* comm, struct ncclKernelPlan* pla
   default: break;
   }
   return ncclSuccess;
+}
+
+
+static void assignRingPrimOpSlots(struct ncclKernelPlan* plan) {
+  struct ncclWorkList* workNode = ncclIntruQueueHead(&plan->workQueue);
+  while (workNode != nullptr) {
+    if (workNode->workType == ncclDevWorkTypeColl || workNode->workType == ncclDevWorkTypeCollReg) {
+      struct ncclDevWorkColl* work = (workNode->workType == ncclDevWorkTypeCollReg)
+          ? &((struct ncclDevWorkCollReg*)(workNode+1))->coll
+          : (struct ncclDevWorkColl*)(workNode+1);
+      uint64_t opSlot = ncclRingPrimMeasureOpSlot.fetch_add(1, std::memory_order_relaxed);
+      work->measureOpSlot = opSlot < NCCL_RING_PRIM_OP_STATS_MAX ? (uint32_t)opSlot : NCCL_RING_PRIM_OP_STATS_MAX;
+    }
+    workNode = workNode->next;
+  }
 }
 
 static ncclResult_t uploadProxyOps(struct ncclComm* comm, struct ncclKernelPlan* plan) {
