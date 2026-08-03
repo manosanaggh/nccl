@@ -33,9 +33,16 @@
 #define NCCL_RING_SYNC_MEASURE_END(_enabled, _syncId, _start) do { \
   if ((_enabled) && ncclShmem.comm.measureRingPrims && ncclShmem.comm.measureRingPrimsStats != nullptr && (_start) != 0ULL) { \
     unsigned long long __ncclRingSyncEnd = globaltimer(); \
+    unsigned long long __ncclRingSyncNs = __ncclRingSyncEnd - (unsigned long long)(_start); \
     int __ncclRingSyncBase = NCCL_RING_PRIM_STATS_SYNC_BASE + ((int)(_syncId)) * NCCL_RING_PRIM_STATS_SYNC_FIELDS; \
     atomicAdd((unsigned long long*)(ncclShmem.comm.measureRingPrimsStats + __ncclRingSyncBase + NCCL_RING_PRIM_STATS_SYNC_COUNT), 1ULL); \
-    atomicAdd((unsigned long long*)(ncclShmem.comm.measureRingPrimsStats + __ncclRingSyncBase + NCCL_RING_PRIM_STATS_SYNC_NS), __ncclRingSyncEnd - (unsigned long long)(_start)); \
+    atomicAdd((unsigned long long*)(ncclShmem.comm.measureRingPrimsStats + __ncclRingSyncBase + NCCL_RING_PRIM_STATS_SYNC_NS), __ncclRingSyncNs); \
+    int __ncclRingSyncChannel = ncclShmem.channelId; \
+    if (__ncclRingSyncChannel >= 0 && __ncclRingSyncChannel < MAXCHANNELS) { \
+      int __ncclRingSyncChannelBase = NCCL_RING_PRIM_STATS_SYNC_CHANNEL_BASE + __ncclRingSyncChannel * NCCL_RING_PRIM_STATS_SYNC_CHANNEL_STRIDE + ((int)(_syncId)) * NCCL_RING_PRIM_STATS_SYNC_FIELDS; \
+      atomicAdd((unsigned long long*)(ncclShmem.comm.measureRingPrimsStats + __ncclRingSyncChannelBase + NCCL_RING_PRIM_STATS_SYNC_COUNT), 1ULL); \
+      atomicAdd((unsigned long long*)(ncclShmem.comm.measureRingPrimsStats + __ncclRingSyncChannelBase + NCCL_RING_PRIM_STATS_SYNC_NS), __ncclRingSyncNs); \
+    } \
   } \
 } while (0)
 #define NCCL_RING_PRIM_MEASURE_START(_tid) \

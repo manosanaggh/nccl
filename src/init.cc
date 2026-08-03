@@ -421,6 +421,41 @@ static void ncclRingIbStagingCopySummary() {
     syncPos += (size_t)written;
   }
 
+  char syncChannelSummary[4096];
+  size_t syncChannelPos = 0;
+  syncChannelSummary[0] = '\0';
+  for (int sync = 0; sync < NCCL_RING_SYNC_NUM; sync++) {
+    uint64_t sumCount = 0;
+    uint64_t sumNs = 0;
+    uint64_t maxNs = 0;
+    int activeChannels = 0;
+    for (int channel = 0; channel < MAXCHANNELS; channel++) {
+      int base = NCCL_RING_PRIM_STATS_SYNC_CHANNEL_BASE + channel * NCCL_RING_PRIM_STATS_SYNC_CHANNEL_STRIDE + sync * NCCL_RING_PRIM_STATS_SYNC_FIELDS;
+      uint64_t count = ncclRingIbStagingCopySummaryStats[base + NCCL_RING_PRIM_STATS_SYNC_COUNT];
+      uint64_t ns = ncclRingIbStagingCopySummaryStats[base + NCCL_RING_PRIM_STATS_SYNC_NS];
+      if (count == 0) continue;
+      activeChannels++;
+      sumCount += count;
+      sumNs += ns;
+      if (ns > maxNs) maxNs = ns;
+    }
+    if (activeChannels == 0) continue;
+    const char* name = ncclRingSyncMeasureName(sync);
+    int written = snprintf(syncChannelSummary + syncChannelPos, sizeof(syncChannelSummary) - syncChannelPos,
+        " %s_ch={active=%d,c=%llu,sum_s=%.6f,avg_ch_s=%.6f,max_ch_s=%.6f,avg_us=%.3f}",
+        name, activeChannels, (unsigned long long)sumCount,
+        (double)sumNs / 1000000000.0,
+        (double)sumNs / (double)activeChannels / 1000000000.0,
+        (double)maxNs / 1000000000.0,
+        sumCount == 0 ? 0.0 : (double)sumNs / (double)sumCount / 1000.0);
+    if (written < 0) break;
+    if ((size_t)written >= sizeof(syncChannelSummary) - syncChannelPos) {
+      syncChannelPos = sizeof(syncChannelSummary) - 1;
+      break;
+    }
+    syncChannelPos += (size_t)written;
+  }
+
   char primSummary[4096];
   size_t pos = 0;
   primSummary[0] = '\0';
@@ -449,12 +484,12 @@ static void ncclRingIbStagingCopySummary() {
   }
 
   INFO(NCCL_NET,
-       "RING_IB_STAGING_COPY summary comms=%llu count=%llu bytes=%llu total_time_ns=%llu total_time_s=%.6f avg_us=%.3f device_kernel_channel_count=%llu device_kernel_channel_active_s=%.6f device_kernel_channel_avg_ms=%.3f ring_sync_path=1%s ring_prim_path=1%s",
+       "RING_IB_STAGING_COPY summary comms=%llu count=%llu bytes=%llu total_time_ns=%llu total_time_s=%.6f avg_us=%.3f device_kernel_channel_count=%llu device_kernel_channel_active_s=%.6f device_kernel_channel_avg_ms=%.3f ring_sync_path=1%s ring_sync_channel_path=1%s ring_prim_path=1%s",
        (unsigned long long)ncclRingIbStagingCopySummaryComms,
        (unsigned long long)stagingCount,
        (unsigned long long)stagingBytes,
        (unsigned long long)stagingNs, totalS, avgUs,
-       (unsigned long long)kernelChannelCount, kernelChannelS, kernelChannelAvgMs, syncSummary, primSummary);
+       (unsigned long long)kernelChannelCount, kernelChannelS, kernelChannelAvgMs, syncSummary, syncChannelSummary, primSummary);
 }
 
 // Detect DMA-BUF support
