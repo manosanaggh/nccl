@@ -74,9 +74,17 @@
     unsigned long long __ncclRingStagingBytes = (unsigned long long)(_nelem) * (unsigned long long)(_typeSize); \
     if (__ncclRingStagingBytes >= ncclShmem.comm.measureRingPrimsMinBytes) { \
       unsigned long long __ncclRingStagingEnd = globaltimer(); \
+      unsigned long long __ncclRingStagingNs = __ncclRingStagingEnd - (unsigned long long)(_start); \
       atomicAdd((unsigned long long*)(ncclShmem.comm.measureRingPrimsStats + NCCL_RING_PRIM_STATS_STAGING_COUNT), 1ULL); \
       atomicAdd((unsigned long long*)(ncclShmem.comm.measureRingPrimsStats + NCCL_RING_PRIM_STATS_STAGING_BYTES), __ncclRingStagingBytes); \
-      atomicAdd((unsigned long long*)(ncclShmem.comm.measureRingPrimsStats + NCCL_RING_PRIM_STATS_STAGING_NS), __ncclRingStagingEnd - (unsigned long long)(_start)); \
+      atomicAdd((unsigned long long*)(ncclShmem.comm.measureRingPrimsStats + NCCL_RING_PRIM_STATS_STAGING_NS), __ncclRingStagingNs); \
+      int __ncclRingStagingChannel = ncclShmem.channelId; \
+      if (__ncclRingStagingChannel >= 0 && __ncclRingStagingChannel < MAXCHANNELS) { \
+        int __ncclRingStagingChannelBase = NCCL_RING_PRIM_STATS_STAGING_CHANNEL_BASE + __ncclRingStagingChannel * NCCL_RING_PRIM_STATS_STAGING_CHANNEL_FIELDS; \
+        atomicAdd((unsigned long long*)(ncclShmem.comm.measureRingPrimsStats + __ncclRingStagingChannelBase + NCCL_RING_PRIM_STATS_STAGING_COUNT), 1ULL); \
+        atomicAdd((unsigned long long*)(ncclShmem.comm.measureRingPrimsStats + __ncclRingStagingChannelBase + NCCL_RING_PRIM_STATS_STAGING_BYTES), __ncclRingStagingBytes); \
+        atomicAdd((unsigned long long*)(ncclShmem.comm.measureRingPrimsStats + __ncclRingStagingChannelBase + NCCL_RING_PRIM_STATS_STAGING_NS), __ncclRingStagingNs); \
+      } \
     } \
   } \
 } while (0)
