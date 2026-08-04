@@ -30,7 +30,8 @@ namespace {
     // coverity[callee_ptr_arith:FALSE]
     bool ringNextIsNet = (ncclShmem.channel.peers[ring->next]->send[0].flags & NCCL_DIRECT_NIC) != 0;
     Primitives<T, RedOp, FanSymmetric<1>, 0, Proto, 0>
-      prims(tid, nthreads, &ring->prev, &ring->next, work->sendbuff, work->recvbuff, work->redOpArg);
+      prims(tid, nthreads, &ring->prev, &ring->next, work->sendbuff, work->recvbuff, work->redOpArg,
+            0, 0, 0, work);
 
     for (size_t elemOffset = 0; elemOffset < channelCount; elemOffset += chunkCount) {
       nelem = min(chunkCount, channelCount - elemOffset);
