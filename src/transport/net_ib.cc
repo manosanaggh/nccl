@@ -24,6 +24,8 @@
 #include <unistd.h>
 #include <atomic>
 #include <mutex>
+#include <vector>
+#include <algorithm>
 #include <time.h>
 #define ENABLE_TIMER 0
 #include "timer.h"
@@ -169,6 +171,96 @@ static inline uint64_t ncclIbMeasureSendNowNs() {
   return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
 }
 
+struct ncclIbMeasureKernelGpuEventPair {
+  cudaEvent_t start;
+  cudaEvent_t end;
+};
+
+static std::mutex ncclIbMeasureKernelGpuEventMutex;
+static std::vector<struct ncclIbMeasureKernelGpuEventPair> ncclIbMeasureKernelGpuEvents;
+
+void ncclIbMeasureKernelGpuEventRecord(cudaEvent_t startEvent, cudaEvent_t endEvent) {
+  if (ncclParamIbMeasureSendKernelOverlap() == 0) {
+    cudaEventDestroy(startEvent);
+    cudaEventDestroy(endEvent);
+    return;
+  }
+  std::lock_guard<std::mutex> lock(ncclIbMeasureKernelGpuEventMutex);
+  ncclIbMeasureKernelGpuEvents.push_back({startEvent, endEvent});
+}
+
+void ncclIbMeasureKernelGpuEventSummary() {
+  if (ncclParamIbMeasureSendKernelOverlap() == 0) return;
+
+  std::vector<struct ncclIbMeasureKernelGpuEventPair> events;
+  {
+    std::lock_guard<std::mutex> lock(ncclIbMeasureKernelGpuEventMutex);
+    events.swap(ncclIbMeasureKernelGpuEvents);
+  }
+  if (events.empty()) return;
+
+  std::vector<std::pair<float, float>> intervals;
+  intervals.reserve(events.size());
+  cudaEvent_t firstStart = events[0].start;
+  unsigned long long failed = 0;
+  for (auto const& ev : events) {
+    cudaError_t syncErr = cudaEventSynchronize(ev.end);
+    float startMs = 0.0f;
+    float endMs = 0.0f;
+    cudaError_t startErr = syncErr == cudaSuccess ? cudaEventElapsedTime(&startMs, firstStart, ev.start) : syncErr;
+    cudaError_t endErr = startErr == cudaSuccess ? cudaEventElapsedTime(&endMs, firstStart, ev.end) : startErr;
+    if (endErr == cudaSuccess && endMs >= startMs) {
+      intervals.push_back({startMs, endMs});
+    } else {
+      failed++;
+    }
+  }
+  for (auto const& ev : events) {
+    cudaEventDestroy(ev.start);
+    cudaEventDestroy(ev.end);
+  }
+  if (intervals.empty()) {
+    INFO(NCCL_NET,
+         "NET/IB: send measure cuda kernel summary events=%llu valid=0 failed=%llu",
+         (unsigned long long)events.size(), failed);
+    return;
+  }
+
+  std::sort(intervals.begin(), intervals.end(), [](const std::pair<float, float>& a, const std::pair<float, float>& b) {
+    return a.first < b.first || (a.first == b.first && a.second < b.second);
+  });
+
+  double activeMs = 0.0;
+  double gapMs = 0.0;
+  unsigned long long gapCount = 0;
+  double curStart = intervals[0].first;
+  double curEnd = intervals[0].second;
+  double windowStart = intervals[0].first;
+  double windowEnd = intervals[0].second;
+  for (size_t i = 1; i < intervals.size(); i++) {
+    double start = intervals[i].first;
+    double end = intervals[i].second;
+    if (end > windowEnd) windowEnd = end;
+    if (start <= curEnd) {
+      if (end > curEnd) curEnd = end;
+    } else {
+      activeMs += curEnd - curStart;
+      gapMs += start - curEnd;
+      gapCount++;
+      curStart = start;
+      curEnd = end;
+    }
+  }
+  activeMs += curEnd - curStart;
+
+  double windowMs = windowEnd - windowStart;
+  double gapPctWindow = windowMs <= 0.0 ? 0.0 : 100.0 * gapMs / windowMs;
+  INFO(NCCL_NET,
+       "NET/IB: send measure cuda kernel summary events=%llu valid=%llu failed=%llu cuda_kernel_active_s=%.6f cuda_kernel_window_s=%.6f cuda_between_kernel_gap_count=%llu cuda_between_kernel_gap_s=%.6f cuda_between_kernel_gap_pct_window=%.2f",
+       (unsigned long long)events.size(), (unsigned long long)intervals.size(), failed,
+       activeMs / 1000.0, windowMs / 1000.0, gapCount, gapMs / 1000.0, gapPctWindow);
+}
+
 bool ncclIbMeasureSendKernelOverlapEnabled() {
   return ncclParamIbMeasureSendKernelOverlap() != 0;
 }
@@ -199,14 +291,16 @@ static inline void ncclIbMeasureSendAccountStateLocked(uint64_t eventNs) {
   if (eventNs < ncclIbMeasureSendLastStateNs) eventNs = ncclIbMeasureSendLastStateNs;
   uint64_t dt = eventNs - ncclIbMeasureSendLastStateNs;
   if (dt != 0) {
-    if (ncclIbMeasureSendIdleOutstanding == 0 && ncclIbMeasureSendIdleStartNs != 0) {
-      if (ncclIbMeasureSendKernelActiveCount != 0) {
+    bool idle = ncclIbMeasureSendIdleOutstanding == 0 && ncclIbMeasureSendIdleStartNs != 0;
+    bool kernelActive = ncclIbMeasureSendKernelActiveCount != 0;
+    if (idle) {
+      if (kernelActive) {
         ncclIbMeasureSendIdleInsideKernelNs += dt;
       } else {
         ncclIbMeasureSendIdleOutsideKernelNs += dt;
       }
     }
-    if (ncclIbMeasureSendKernelActiveCount != 0) ncclIbMeasureSendKernelActiveNs += dt;
+    if (kernelActive) ncclIbMeasureSendKernelActiveNs += dt;
   }
   ncclIbMeasureSendLastStateNs = eventNs;
 }

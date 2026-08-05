@@ -1306,6 +1306,20 @@ static void assignRingPrimOpSlots(struct ncclKernelPlan* plan) {
   }
 }
 
+static bool planHasMeasureAgRsWork(struct ncclKernelPlan* plan) {
+  struct ncclWorkList* workNode = ncclIntruQueueHead(&plan->workQueue);
+  while (workNode != nullptr) {
+    if (workNode->workType == ncclDevWorkTypeColl || workNode->workType == ncclDevWorkTypeCollReg) {
+      struct ncclDevWorkColl* work = (workNode->workType == ncclDevWorkTypeCollReg)
+          ? &((struct ncclDevWorkCollReg*)(workNode+1))->coll
+          : (struct ncclDevWorkColl*)(workNode+1);
+      if (work->measureFunc == ncclFuncAllGather || work->measureFunc == ncclFuncReduceScatter) return true;
+    }
+    workNode = workNode->next;
+  }
+  return false;
+}
+
 static ncclResult_t uploadProxyOps(struct ncclComm* comm, struct ncclKernelPlan* plan) {
   uint64_t collOpCount = comm->sharedRes->collOpCount;
   uint64_t p2pOpBump[MAXCHANNELS] = {/*0...*/};
@@ -1633,9 +1647,13 @@ ncclResult_t ncclLaunchKernel(struct ncclComm* comm, struct ncclKernelPlan* plan
     CU_LAUNCH_PARAM_END
   };
 
-  bool measureKernelOverlap = ncclIbMeasureSendKernelOverlapEnabled() && !ncclCudaGraphValid(planner->capturingGraph);
+  bool measureKernelOverlap = ncclIbMeasureSendKernelOverlapEnabled() && !ncclCudaGraphValid(planner->capturingGraph) && planHasMeasureAgRsWork(plan);
   bool measureKernelActiveStarted = false;
   bool measureKernelActiveEndQueued = false;
+  bool measureKernelGpuEventsCreated = false;
+  bool measureKernelGpuEventsRecorded = false;
+  cudaEvent_t measureKernelStartEvent = NULL;
+  cudaEvent_t measureKernelEndEvent = NULL;
 
   int driverVersion;
   NCCLCHECKGOTO(ncclCudaDriverVersion(&driverVersion), ret, do_return);
@@ -1709,6 +1727,10 @@ ncclResult_t ncclLaunchKernel(struct ncclComm* comm, struct ncclKernelPlan* plan
     launchConfig.numAttrs = attrs;
     launchConfig.hStream = launchStream;
     if (measureKernelOverlap) {
+      CUDACHECKGOTO(cudaEventCreate(&measureKernelStartEvent), ret, do_return);
+      measureKernelGpuEventsCreated = true;
+      CUDACHECKGOTO(cudaEventCreate(&measureKernelEndEvent), ret, do_return);
+      CUDACHECKGOTO(cudaEventRecord(measureKernelStartEvent, launchStream), ret, do_return);
       ncclIbMeasureKernelActiveStart();
       measureKernelActiveStarted = true;
     }
@@ -1717,6 +1739,10 @@ ncclResult_t ncclLaunchKernel(struct ncclComm* comm, struct ncclKernelPlan* plan
   } else {
     // Standard kernel launch
     if (measureKernelOverlap) {
+      CUDACHECKGOTO(cudaEventCreate(&measureKernelStartEvent), ret, do_return);
+      measureKernelGpuEventsCreated = true;
+      CUDACHECKGOTO(cudaEventCreate(&measureKernelEndEvent), ret, do_return);
+      CUDACHECKGOTO(cudaEventRecord(measureKernelStartEvent, launchStream), ret, do_return);
       ncclIbMeasureKernelActiveStart();
       measureKernelActiveStarted = true;
     }
@@ -1724,6 +1750,9 @@ ncclResult_t ncclLaunchKernel(struct ncclComm* comm, struct ncclKernelPlan* plan
   }
 
   if (measureKernelOverlap) {
+    CUDACHECKGOTO(cudaEventRecord(measureKernelEndEvent, launchStream), ret, do_return);
+    ncclIbMeasureKernelGpuEventRecord(measureKernelStartEvent, measureKernelEndEvent);
+    measureKernelGpuEventsRecorded = true;
     cudaError_t cbStatus = cudaLaunchHostFunc(launchStream, ncclIbMeasureKernelActiveEndCallback, nullptr);
     if (cbStatus == cudaSuccess) {
       measureKernelActiveEndQueued = true;
@@ -1734,6 +1763,10 @@ ncclResult_t ncclLaunchKernel(struct ncclComm* comm, struct ncclKernelPlan* plan
 
 do_return:
   if (measureKernelActiveStarted && !measureKernelActiveEndQueued) ncclIbMeasureKernelActiveEnd();
+  if (measureKernelGpuEventsCreated && !measureKernelGpuEventsRecorded) {
+    if (measureKernelStartEvent != NULL) CUDACHECK(cudaEventDestroy(measureKernelStartEvent));
+    if (measureKernelEndEvent != NULL) CUDACHECK(cudaEventDestroy(measureKernelEndEvent));
+  }
   NCCLCHECK(ncclProfilerStopKernelLaunchEvent(plan));
   return ret;
 }

@@ -2496,6 +2496,7 @@ static ncclResult_t commDestroySync(struct ncclAsyncJob* job_) {
 
     NCCLCHECKGOTO(ncclCommPollEventCallbacks(comm, true), ret, fail);
     NCCLCHECKGOTO(ncclCommPollCallbacks(comm, false), ret, fail);
+    ncclIbMeasureKernelGpuEventSummary();
     // And keep polling until all graphs referencing us die.
     while (comm->localPersistentRefs != 0) {
       NCCLCHECKGOTO(ncclCommPollCallbacks(comm, /*waitSome=*/true), ret, fail);

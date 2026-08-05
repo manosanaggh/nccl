@@ -35,6 +35,8 @@ extern ncclGin_t ncclGinIbProxy;
 bool ncclIbMeasureSendKernelOverlapEnabled();
 void ncclIbMeasureKernelActiveStart();
 void ncclIbMeasureKernelActiveEnd();
+void ncclIbMeasureKernelGpuEventRecord(cudaEvent_t startEvent, cudaEvent_t endEvent);
+void ncclIbMeasureKernelGpuEventSummary();
 bool ncclCodepathTraceEnabled();
 bool ncclCodepathTraceTake(uint64_t bytes);
 
