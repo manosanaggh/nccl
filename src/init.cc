@@ -421,6 +421,39 @@ static void ncclRingIbStagingCopySummary() {
   double stagingChannelMaxChS = (double)stagingChannelMaxNs / 1000000000.0;
   double stagingChannelAvgUs = stagingChannelSumCount == 0 ? 0.0 : (double)stagingChannelSumNs / (double)stagingChannelSumCount / 1000.0;
 
+  uint64_t roundTripSumCount = 0;
+  uint64_t roundTripSumNs = 0;
+  uint64_t roundTripMaxNs = 0;
+  int roundTripActiveChannels = 0;
+  char roundTripChannelSummary[4096];
+  size_t roundTripChannelPos = 0;
+  roundTripChannelSummary[0] = '\0';
+  for (int channel = 0; channel < MAXCHANNELS; channel++) {
+    int base = NCCL_RING_PRIM_STATS_ROUNDTRIP_CHANNEL_BASE + channel * NCCL_RING_PRIM_STATS_ROUNDTRIP_CHANNEL_FIELDS;
+    uint64_t count = ncclRingIbStagingCopySummaryStats[base + NCCL_RING_PRIM_STATS_ROUNDTRIP_COUNT];
+    uint64_t ns = ncclRingIbStagingCopySummaryStats[base + NCCL_RING_PRIM_STATS_ROUNDTRIP_NS];
+    uint64_t maxNs = ncclRingIbStagingCopySummaryStats[base + NCCL_RING_PRIM_STATS_ROUNDTRIP_MAX_NS];
+    if (count == 0) continue;
+    roundTripActiveChannels++;
+    roundTripSumCount += count;
+    roundTripSumNs += ns;
+    if (maxNs > roundTripMaxNs) roundTripMaxNs = maxNs;
+    int written = snprintf(roundTripChannelSummary + roundTripChannelPos, sizeof(roundTripChannelSummary) - roundTripChannelPos,
+        " ch%d={count=%llu,total_gpu_roundtrip_ns=%llu,avg_gpu_roundtrip_us=%.3f,max_gpu_roundtrip_us=%.3f}",
+        channel, (unsigned long long)count, (unsigned long long)ns,
+        (double)ns / (double)count / 1000.0,
+        (double)maxNs / 1000.0);
+    if (written < 0) break;
+    if ((size_t)written >= sizeof(roundTripChannelSummary) - roundTripChannelPos) {
+      roundTripChannelPos = sizeof(roundTripChannelSummary) - 1;
+      break;
+    }
+    roundTripChannelPos += (size_t)written;
+  }
+  double roundTripTotalS = (double)roundTripSumNs / 1000000000.0;
+  double roundTripAvgUs = roundTripSumCount == 0 ? 0.0 : (double)roundTripSumNs / (double)roundTripSumCount / 1000.0;
+  double roundTripMaxUs = (double)roundTripMaxNs / 1000.0;
+
   char syncSummary[2048];
   size_t syncPos = 0;
   syncSummary[0] = '\0';
@@ -519,6 +552,11 @@ static void ncclRingIbStagingCopySummary() {
        stagingChannelAvgChS, stagingChannelMaxChS, stagingChannelAvgUs);
   INFO(NCCL_NET, "RING_SYNC summary ring_sync_path=1%s", syncSummary);
   INFO(NCCL_NET, "RING_SYNC_CHANNEL summary ring_sync_channel_path=1%s", syncChannelSummary);
+  INFO(NCCL_NET,
+       "RING_GPU_ROUNDTRIP summary ring_gpu_roundtrip_path=1 active_channels=%d count=%llu total_gpu_roundtrip_ns=%llu total_gpu_roundtrip_s=%.6f avg_gpu_roundtrip_us=%.3f max_gpu_roundtrip_us=%.3f%s",
+       roundTripActiveChannels, (unsigned long long)roundTripSumCount,
+       (unsigned long long)roundTripSumNs, roundTripTotalS, roundTripAvgUs, roundTripMaxUs,
+       roundTripChannelSummary);
   INFO(NCCL_NET, "RING_PRIM summary ring_prim_path=1%s", primSummary);
 
 

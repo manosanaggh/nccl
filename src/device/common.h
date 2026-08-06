@@ -29,6 +29,7 @@ extern __device__ ncclDevFuncPtr_t const ncclDevFuncTable[];
 struct ncclShmemGroup {
   ncclConnInfo *recvConns[NCCL_MAX_ARITY];
   ncclConnInfo *sendConns[NCCL_MAX_ARITY];
+  uint64_t sendRoundTripStart[NCCL_MAX_ARITY];
   void* userInput;
   void* userOutput;
   void* srcs[NCCL_MAX_ARITY+1];

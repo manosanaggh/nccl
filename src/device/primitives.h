@@ -112,6 +112,19 @@
     } \
   } \
 } while (0)
+#define NCCL_RING_SEND_ROUNDTRIP_MEASURE_END(_enabled, _start) do { \
+  if ((_enabled) && ncclShmem.comm.measureRingPrims && ncclShmem.comm.measureRingPrimsStats != nullptr && (_start) != 0ULL) { \
+    unsigned long long __ncclRingRtEnd = globaltimer(); \
+    unsigned long long __ncclRingRtNs = __ncclRingRtEnd - (unsigned long long)(_start); \
+    int __ncclRingRtChannel = ncclShmem.channelId; \
+    if (__ncclRingRtChannel >= 0 && __ncclRingRtChannel < MAXCHANNELS) { \
+      int __ncclRingRtBase = NCCL_RING_PRIM_STATS_ROUNDTRIP_CHANNEL_BASE + __ncclRingRtChannel * NCCL_RING_PRIM_STATS_ROUNDTRIP_CHANNEL_FIELDS; \
+      atomicAdd((unsigned long long*)(ncclShmem.comm.measureRingPrimsStats + __ncclRingRtBase + NCCL_RING_PRIM_STATS_ROUNDTRIP_COUNT), 1ULL); \
+      atomicAdd((unsigned long long*)(ncclShmem.comm.measureRingPrimsStats + __ncclRingRtBase + NCCL_RING_PRIM_STATS_ROUNDTRIP_NS), __ncclRingRtNs); \
+      atomicMax((unsigned long long*)(ncclShmem.comm.measureRingPrimsStats + __ncclRingRtBase + NCCL_RING_PRIM_STATS_ROUNDTRIP_MAX_NS), __ncclRingRtNs); \
+    } \
+  } \
+} while (0)
 #else
 #define NCCL_RING_KERNEL_CHANNEL_MEASURE_START(_tid) 0ULL
 #define NCCL_RING_OP_MEASURE_VALID(_work) 0
@@ -124,6 +137,7 @@
 #define NCCL_RING_PRIM_MEASURE_END(_tid, _primId, _elemOffset, _chunkCount, _nelem, _typeSize, _start) do {} while (0)
 #define NCCL_RING_IB_STAGING_COPY_MEASURE_START(_enabled, _tid) 0ULL
 #define NCCL_RING_IB_STAGING_COPY_MEASURE_END(_enabled, _tid, _prim, _nelem, _typeSize, _start, _work) do {} while (0)
+#define NCCL_RING_SEND_ROUNDTRIP_MEASURE_END(_enabled, _start) do {} while (0)
 #endif
 /* Protocol classes: ProtoSimple, ProtoLL, ProtoLL128
  * We use these as template args to the Primtiives class instead of integral

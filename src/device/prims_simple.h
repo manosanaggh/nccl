@@ -34,7 +34,8 @@ class Primitives<
                        PatMode = 0x800,
                        NvlsMinPolling = 0x1000,
                        NetDeviceUnpack = 0x2000,
-                       AnyNetDeviceUnpack = 0x4000;
+                       AnyNetDeviceUnpack = 0x4000,
+                       NetSendRoundTrip = 0x8000;
   const int tid, tidInBlock;
   const int nthreads;
   int nworkers;
@@ -126,6 +127,11 @@ class Primitives<
         //if (spins == 0) printf("r=%d b=%d t=%d SPUN OUT got=%d want=%d\n", ncclShmem.comm.rank, blockIdx.x, threadIdx.x, int(connStepCache + (isSendNotRecv ? NCCL_STEPS : 0)), int(step+StepPerSlice));
       }
       NCCL_RING_SYNC_MEASURE_END(waitNeeded, isSendNotRecv ? NCCL_RING_SYNC_WAIT_SEND : NCCL_RING_SYNC_WAIT_RECV, syncStart, measureCollWork);
+      if (isSendNotRecv && (flags & NetSendRoundTrip)) {
+        unsigned long long roundTripStart = ncclShmem.groups[group].sendRoundTripStart[index];
+        NCCL_RING_SEND_ROUNDTRIP_MEASURE_END(1, roundTripStart);
+        ncclShmem.groups[group].sendRoundTripStart[index] = 0ULL;
+      }
     }
 
     if (flags & (Recv*RoleWaitRecv | Send*RoleWaitSend)) {
@@ -183,12 +189,15 @@ class Primitives<
     if (flags & (Recv*RolePostRecv | Send*RolePostSend)) {
       unsigned long long syncStart = NCCL_RING_SYNC_MEASURE_START(1);
       step += StepPerSlice;
-      if (Send && (flags & RolePostSend) && (dataStored||(flags&ConnFifoEnabled))) {
+      bool postedSend = Send && (flags & RolePostSend) && (dataStored||(flags&ConnFifoEnabled));
+      if (postedSend) {
         unsigned long long fenceStart = NCCL_RING_SYNC_MEASURE_START(1);
         fence_acq_rel_sys();
         NCCL_RING_SYNC_MEASURE_END(1, NCCL_RING_SYNC_POST_FENCE, fenceStart, measureCollWork);
       }
+      unsigned long long roundTripStart = (postedSend && (flags & NetSendRoundTrip)) ? globaltimer() : 0ULL;
       st_relaxed_sys_global(connStepPtr, step);
+      if (roundTripStart != 0ULL) ncclShmem.groups[group].sendRoundTripStart[index] = roundTripStart;
       NCCL_RING_SYNC_MEASURE_END(1, NCCL_RING_SYNC_POST_PEER, syncStart, measureCollWork);
     }
   }
@@ -572,6 +581,7 @@ private:
 
   __device__ __forceinline__ void loadSendConn(ncclDevChannelPeer *peer, int connIndex, uint32_t direct, int ipcRegFlag, int netRegFlag) {
     conn = &peer->send[connIndex];
+    if ((conn->flags & (NCCL_P2P_WRITE | NCCL_P2P_READ | NCCL_NVLS_MIN_POLL)) == 0) flags |= NetSendRoundTrip;
     step = conn->step;
     step = roundUp(step, SlicePerChunk*StepPerSlice);
 
@@ -677,6 +687,10 @@ private:
         recvIpcReg = sendIpcReg = collWork ? collWork->regUsed : 0;
         recvNetReg = sendNetReg = collWork ? collWork->netRegUsed : 0;
       }
+
+      if (tid < NCCL_MAX_ARITY) ncclShmem.groups[group].sendRoundTripStart[tid] = 0ULL;
+      if (nthreads == WARP_SIZE) __syncwarp();
+      else barrier_sync(15-group, nthreads);
 
       // coverity[overrun-call] => Coverity think prims.index can be greater than 1
       if (flags & (RoleWaitRecv|RolePostRecv)) loadRecvConn(ncclShmem.channel.peers[peer], connIndexRecv, collWork ? collWork->direct : 0, recvIpcReg, recvNetReg);
