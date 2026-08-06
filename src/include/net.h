@@ -33,6 +33,7 @@ extern ncclGin_t ncclGinIbGdaki;
 extern ncclGin_t ncclGinIbProxy;
 
 bool ncclIbMeasureSendKernelOverlapEnabled();
+bool ncclIbMeasureSendKernelOverlapCallbacksEnabled();
 void ncclIbMeasureKernelActiveStart();
 void ncclIbMeasureKernelActiveEnd();
 void ncclIbMeasureKernelGpuEventRecord(cudaEvent_t startEvent, cudaEvent_t endEvent);

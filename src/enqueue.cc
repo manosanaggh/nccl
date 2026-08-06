@@ -33,6 +33,10 @@ static void CUDART_CB ncclIbMeasureKernelActiveEndCallback(void*) {
   ncclIbMeasureKernelActiveEnd();
 }
 
+static void CUDART_CB ncclIbMeasureKernelActiveStartCallback(void*) {
+  ncclIbMeasureKernelActiveStart();
+}
+
 // Returns maximum kernel stack size of all CUDA kernels
 ncclResult_t ncclInitKernelsForDevice(int cudaArch, int maxSharedMem, size_t* maxStackSize) {
   ncclResult_t result = ncclSuccess;
@@ -1648,6 +1652,7 @@ ncclResult_t ncclLaunchKernel(struct ncclComm* comm, struct ncclKernelPlan* plan
   };
 
   bool measureKernelOverlap = ncclIbMeasureSendKernelOverlapEnabled() && !ncclCudaGraphValid(planner->capturingGraph) && planHasMeasureAgRsWork(plan);
+  bool measureKernelOverlapCallbacks = measureKernelOverlap && ncclIbMeasureSendKernelOverlapCallbacksEnabled();
   bool measureKernelActiveStarted = false;
   bool measureKernelActiveEndQueued = false;
   bool measureKernelGpuEventsCreated = false;
@@ -1731,8 +1736,13 @@ ncclResult_t ncclLaunchKernel(struct ncclComm* comm, struct ncclKernelPlan* plan
       measureKernelGpuEventsCreated = true;
       CUDACHECKGOTO(cudaEventCreate(&measureKernelEndEvent), ret, do_return);
       CUDACHECKGOTO(cudaEventRecord(measureKernelStartEvent, launchStream), ret, do_return);
-      ncclIbMeasureKernelActiveStart();
-      measureKernelActiveStarted = true;
+      if (measureKernelOverlapCallbacks) {
+        CUDACHECKGOTO(cudaLaunchHostFunc(launchStream, ncclIbMeasureKernelActiveStartCallback, nullptr), ret, do_return);
+        measureKernelActiveStarted = true;
+      } else {
+        ncclIbMeasureKernelActiveStart();
+        measureKernelActiveStarted = true;
+      }
     }
     CUCHECKGOTO(cuLaunchKernelEx(&launchConfig, fn, nullptr, extra), ret, do_return);
   #endif
@@ -1743,8 +1753,13 @@ ncclResult_t ncclLaunchKernel(struct ncclComm* comm, struct ncclKernelPlan* plan
       measureKernelGpuEventsCreated = true;
       CUDACHECKGOTO(cudaEventCreate(&measureKernelEndEvent), ret, do_return);
       CUDACHECKGOTO(cudaEventRecord(measureKernelStartEvent, launchStream), ret, do_return);
-      ncclIbMeasureKernelActiveStart();
-      measureKernelActiveStarted = true;
+      if (measureKernelOverlapCallbacks) {
+        CUDACHECKGOTO(cudaLaunchHostFunc(launchStream, ncclIbMeasureKernelActiveStartCallback, nullptr), ret, do_return);
+        measureKernelActiveStarted = true;
+      } else {
+        ncclIbMeasureKernelActiveStart();
+        measureKernelActiveStarted = true;
+      }
     }
     CUCHECKGOTO(cuLaunchKernel(fn, grid.x, grid.y, grid.z, block.x, block.y, block.z, smem, launchStream, nullptr, extra), ret, do_return);
   }

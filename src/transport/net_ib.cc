@@ -137,6 +137,7 @@ NCCL_PARAM(IbMeasureSendLogEvery, "IB_MEASURE_SEND_LOG_EVERY", 0);
 NCCL_PARAM(IbMeasureSendMinBytes, "IB_MEASURE_SEND_MIN_BYTES", 0);
 NCCL_PARAM(IbMeasureSendIdleNvtx, "IB_MEASURE_SEND_IDLE_NVTX", 0);
 NCCL_PARAM(IbMeasureSendKernelOverlap, "IB_MEASURE_SEND_KERNEL_OVERLAP", 0);
+NCCL_PARAM(IbMeasureSendKernelOverlapCallbacks, "IB_MEASURE_SEND_KERNEL_OVERLAP_CALLBACKS", 0);
 NCCL_PARAM(CodepathTrace, "CODEPATH_TRACE", 0);
 NCCL_PARAM(CodepathTraceLimit, "CODEPATH_TRACE_LIMIT", 64);
 NCCL_PARAM(CodepathTraceMinBytes, "CODEPATH_TRACE_MIN_BYTES", 0);
@@ -263,6 +264,10 @@ void ncclIbMeasureKernelGpuEventSummary() {
 
 bool ncclIbMeasureSendKernelOverlapEnabled() {
   return ncclParamIbMeasureSendKernelOverlap() != 0;
+}
+
+bool ncclIbMeasureSendKernelOverlapCallbacksEnabled() {
+  return ncclParamIbMeasureSendKernelOverlapCallbacks() != 0;
 }
 
 bool ncclCodepathTraceEnabled() {
