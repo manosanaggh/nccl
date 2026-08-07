@@ -266,8 +266,8 @@ class Primitives<
           subBarrier();
         }
 
-        bool measureIbStagingCopy = false;
-        if (Send && tid == 0) {
+        bool ibStagingCopy = false;
+        if (Send) {
           ncclConnInfo* sendConn = ncclShmem.groups[group].sendConns[0];
           int sendDstIndex = Dst ? 1 : 0;
           if (sendConn != nullptr && !(sendConn->flags & (NCCL_P2P_READ | NCCL_P2P_WRITE))) {
@@ -275,10 +275,12 @@ class Primitives<
             char* dstPtr = (char*)ncclShmem.groups[group].dsts[sendDstIndex];
             if (sendBuffBeg != nullptr && dstPtr != nullptr) {
               char* sendBuffEnd = sendBuffBeg + sendConn->stepSize * NCCL_STEPS;
-              measureIbStagingCopy = dstPtr >= sendBuffBeg && dstPtr < sendBuffEnd;
+              ibStagingCopy = dstPtr >= sendBuffBeg && dstPtr < sendBuffEnd;
             }
           }
         }
+        bool measureIbStagingCopy = ibStagingCopy && tid == 0;
+        bool skipIbStagingCopy = ibStagingCopy && ncclShmem.comm.skipIbStagingCopy;
 
         if (DirectRecv && ncclShmem.groups[group].srcs[0] == ncclShmem.groups[group].dsts[0]
             /* NVLS can have srcs[0] == dsts[0], but we cannot enter this "if branch",
@@ -286,47 +288,55 @@ class Primitives<
             && MultimemSrcs == 0 && MultimemDsts == 0 && !Src) {
           // We can only have one direct receive. Since srcs[0] == dstPtr+offset, skip one copy
           if (Send && Dst && ncclShmem.groups[group].srcs[0] != ncclShmem.groups[group].dsts[1]) {
-            unsigned long long stagingCopyStart = NCCL_RING_IB_STAGING_COPY_MEASURE_START(measureIbStagingCopy, tid);
-            reduceCopy<Unroll, RedOp, T, 0, 1, 1, 0, 1, MaxSend, /*PreOpSrcs*/0>
-              (tid, nworkers, /*redArg*/0, /*preOpArgs*/nullptr, /*postOp*/false,
-               1, ncclShmem.groups[group].srcs,
-               fan.nsend(), ncclShmem.groups[group].dsts+1,
-               workSize);
-            NCCL_RING_IB_STAGING_COPY_MEASURE_END(measureIbStagingCopy, tid, primName, workSize, sizeof(T), stagingCopyStart, measureCollWork);
+            if (!skipIbStagingCopy) {
+              unsigned long long stagingCopyStart = NCCL_RING_IB_STAGING_COPY_MEASURE_START(measureIbStagingCopy, tid);
+              reduceCopy<Unroll, RedOp, T, 0, 1, 1, 0, 1, MaxSend, /*PreOpSrcs*/0>
+                (tid, nworkers, /*redArg*/0, /*preOpArgs*/nullptr, /*postOp*/false,
+                 1, ncclShmem.groups[group].srcs,
+                 fan.nsend(), ncclShmem.groups[group].dsts+1,
+                 workSize);
+              NCCL_RING_IB_STAGING_COPY_MEASURE_END(measureIbStagingCopy, tid, primName, workSize, sizeof(T), stagingCopyStart, measureCollWork);
+            }
           }
         } else if (DirectSend && !DirectRecv && SrcBuf != Input && ncclShmem.groups[group].dsts[Dst] == nullptr) {
           // For broadcast in CollNet to do empty send
-          unsigned long long stagingCopyStart = NCCL_RING_IB_STAGING_COPY_MEASURE_START(measureIbStagingCopy, tid);
-          reduceCopy<Unroll, RedOp, T, 0, 1, 1, 0, 1, 1, /*PreOpSrcs*/0>
-            (tid, nworkers, ncclShmem.redOpArgs[0],  nullptr, postOp,
-             Recv, ncclShmem.groups[group].srcs,
-             Dst, ncclShmem.groups[group].dsts,
-             workSize);
-          NCCL_RING_IB_STAGING_COPY_MEASURE_END(measureIbStagingCopy, tid, primName, workSize, sizeof(T), stagingCopyStart, measureCollWork);
+          if (!skipIbStagingCopy) {
+            unsigned long long stagingCopyStart = NCCL_RING_IB_STAGING_COPY_MEASURE_START(measureIbStagingCopy, tid);
+            reduceCopy<Unroll, RedOp, T, 0, 1, 1, 0, 1, 1, /*PreOpSrcs*/0>
+              (tid, nworkers, ncclShmem.redOpArgs[0],  nullptr, postOp,
+               Recv, ncclShmem.groups[group].srcs,
+               Dst, ncclShmem.groups[group].dsts,
+               workSize);
+            NCCL_RING_IB_STAGING_COPY_MEASURE_END(measureIbStagingCopy, tid, primName, workSize, sizeof(T), stagingCopyStart, measureCollWork);
+          }
         } else if (ncclShmem.groups[group].srcs[0] && ncclShmem.groups[group].dsts[0]) {
           constexpr int PreOpSrcs = SrcBuf != Input ? 0 :
                                     DirectRecv*MaxRecv == NCCL_MAX_DIRECT_ARITY ? (1+NCCL_MAX_DIRECT_ARITY) : 1;
           if (Send && Dst && ncclShmem.groups[group].dsts[1] == nullptr) {
             // this case should only be directCopySend() with registered buffers and send to net peer
-            unsigned long long stagingCopyStart = NCCL_RING_IB_STAGING_COPY_MEASURE_START(measureIbStagingCopy, tid);
-            reduceCopy<Unroll, RedOp, T,
-              0, Recv + Src, Recv * MaxRecv + Src,
-              0, 1, 1, PreOpSrcs>
-              (tid, nworkers, ncclShmem.redOpArgs[0], ncclShmem.redOpArgs, postOp,
-                Recv * fan.nrecv() + Src, ncclShmem.groups[group].srcs,
-                1, ncclShmem.groups[group].dsts,
-                workSize);
-            NCCL_RING_IB_STAGING_COPY_MEASURE_END(measureIbStagingCopy, tid, primName, workSize, sizeof(T), stagingCopyStart, measureCollWork);
+            if (!skipIbStagingCopy) {
+              unsigned long long stagingCopyStart = NCCL_RING_IB_STAGING_COPY_MEASURE_START(measureIbStagingCopy, tid);
+              reduceCopy<Unroll, RedOp, T,
+                0, Recv + Src, Recv * MaxRecv + Src,
+                0, 1, 1, PreOpSrcs>
+                (tid, nworkers, ncclShmem.redOpArgs[0], ncclShmem.redOpArgs, postOp,
+                  Recv * fan.nrecv() + Src, ncclShmem.groups[group].srcs,
+                  1, ncclShmem.groups[group].dsts,
+                  workSize);
+              NCCL_RING_IB_STAGING_COPY_MEASURE_END(measureIbStagingCopy, tid, primName, workSize, sizeof(T), stagingCopyStart, measureCollWork);
+            }
           } else {
-            unsigned long long stagingCopyStart = NCCL_RING_IB_STAGING_COPY_MEASURE_START(measureIbStagingCopy, tid);
-            reduceCopy<Unroll, RedOp, T,
-              MultimemSrcs, Recv + Src, Recv * MaxRecv + Src,
-              MultimemDsts, Send + Dst, Send * MaxSend + Dst, PreOpSrcs>
-              (tid, nworkers, ncclShmem.redOpArgs[0], ncclShmem.redOpArgs, postOp,
-                Recv * fan.nrecv() + Src, ncclShmem.groups[group].srcs,
-                Send * fan.nsend() + Dst, ncclShmem.groups[group].dsts,
-                workSize);
-            NCCL_RING_IB_STAGING_COPY_MEASURE_END(measureIbStagingCopy, tid, primName, workSize, sizeof(T), stagingCopyStart, measureCollWork);
+            if (!skipIbStagingCopy) {
+              unsigned long long stagingCopyStart = NCCL_RING_IB_STAGING_COPY_MEASURE_START(measureIbStagingCopy, tid);
+              reduceCopy<Unroll, RedOp, T,
+                MultimemSrcs, Recv + Src, Recv * MaxRecv + Src,
+                MultimemDsts, Send + Dst, Send * MaxSend + Dst, PreOpSrcs>
+                (tid, nworkers, ncclShmem.redOpArgs[0], ncclShmem.redOpArgs, postOp,
+                  Recv * fan.nrecv() + Src, ncclShmem.groups[group].srcs,
+                  Send * fan.nsend() + Dst, ncclShmem.groups[group].dsts,
+                  workSize);
+              NCCL_RING_IB_STAGING_COPY_MEASURE_END(measureIbStagingCopy, tid, primName, workSize, sizeof(T), stagingCopyStart, measureCollWork);
+            }
           }
         } else {
           // we will come here when calling prims.directSend with net peer,

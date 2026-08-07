@@ -351,6 +351,7 @@ NCCL_PARAM(WorkArgsBytes, "WORK_ARGS_BYTES", INT64_MAX);
 enum ncclLaunchMode ncclParamLaunchMode;
 
 NCCL_PARAM(DmaBufEnable, "DMABUF_ENABLE", 1);
+NCCL_PARAM(DeviceSkipIbStagingCopy, "DEVICE_SKIP_IB_STAGING_COPY", 0);
 NCCL_PARAM(DeviceMeasureRingPrims, "DEVICE_MEASURE_RING_PRIMS", 0);
 NCCL_PARAM(DeviceMeasureRingPrimsLogEvery, "DEVICE_MEASURE_RING_PRIMS_LOG_EVERY", 1);
 NCCL_PARAM(DeviceMeasureRingPrimsMinBytes, "DEVICE_MEASURE_RING_PRIMS_MIN_BYTES", 0);
@@ -805,6 +806,7 @@ static ncclResult_t devCommSetup(ncclComm_t comm) {
   tmpCommAndChans.comm.nNodes = comm->nNodes;
   tmpCommAndChans.comm.abortFlag = comm->abortFlagDev;
   tmpCommAndChans.comm.isAllNvlink = comm->isAllNvlink;
+  tmpCommAndChans.comm.skipIbStagingCopy = ncclParamDeviceSkipIbStagingCopy() != 0;
   tmpCommAndChans.comm.measureRingPrims = ncclParamDeviceMeasureRingPrims() != 0;
   tmpCommAndChans.comm.measureRingPrimsLogEvery = std::max<int64_t>(1, ncclParamDeviceMeasureRingPrimsLogEvery());
   tmpCommAndChans.comm.measureRingPrimsMinBytes = std::max<int64_t>(0, ncclParamDeviceMeasureRingPrimsMinBytes());
