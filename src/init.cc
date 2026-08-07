@@ -539,26 +539,26 @@ static void ncclRingIbStagingCopySummary() {
     pos += (size_t)written;
   }
 
-  INFO(NCCL_NET,
-       "RING_IB_STAGING_COPY summary comms=%llu count=%llu bytes=%llu total_time_ns=%llu total_time_s=%.6f avg_us=%.3f device_kernel_channel_count=%llu device_kernel_channel_active_s=%.6f device_kernel_channel_avg_ms=%.3f",
+  fprintf(stderr,
+       "NCCL INFO RING_IB_STAGING_COPY summary comms=%llu count=%llu bytes=%llu total_time_ns=%llu total_time_s=%.6f avg_us=%.3f device_kernel_channel_count=%llu device_kernel_channel_active_s=%.6f device_kernel_channel_avg_ms=%.3f\n",
        (unsigned long long)ncclRingIbStagingCopySummaryComms,
        (unsigned long long)stagingCount,
        (unsigned long long)stagingBytes,
        (unsigned long long)stagingNs, totalS, avgUs,
        (unsigned long long)kernelChannelCount, kernelChannelS, kernelChannelAvgMs);
-  INFO(NCCL_NET,
-       "RING_IB_STAGING_COPY_CHANNEL summary ring_staging_channel_path=1 staging_ch={active=%d,c=%llu,bytes=%llu,sum_s=%.6f,avg_ch_s=%.6f,max_ch_s=%.6f,avg_us=%.3f}",
+  fprintf(stderr,
+       "NCCL INFO RING_IB_STAGING_COPY_CHANNEL summary ring_staging_channel_path=1 staging_ch={active=%d,c=%llu,bytes=%llu,sum_s=%.6f,avg_ch_s=%.6f,max_ch_s=%.6f,avg_us=%.3f}\n",
        stagingChannelActive, (unsigned long long)stagingChannelSumCount,
        (unsigned long long)stagingChannelSumBytes, stagingChannelSumS,
        stagingChannelAvgChS, stagingChannelMaxChS, stagingChannelAvgUs);
-  INFO(NCCL_NET, "RING_SYNC summary ring_sync_path=1%s", syncSummary);
-  INFO(NCCL_NET, "RING_SYNC_CHANNEL summary ring_sync_channel_path=1%s", syncChannelSummary);
-  INFO(NCCL_NET,
-       "RING_GPU_ROUNDTRIP summary ring_gpu_roundtrip_path=1 active_channels=%d count=%llu total_gpu_roundtrip_ns=%llu total_gpu_roundtrip_s=%.6f avg_gpu_roundtrip_us=%.3f max_gpu_roundtrip_us=%.3f%s",
+  fprintf(stderr, "NCCL INFO RING_SYNC summary ring_sync_path=1%s\n", syncSummary);
+  fprintf(stderr, "NCCL INFO RING_SYNC_CHANNEL summary ring_sync_channel_path=1%s\n", syncChannelSummary);
+  fprintf(stderr,
+       "NCCL INFO RING_GPU_ROUNDTRIP summary ring_gpu_roundtrip_path=1 active_channels=%d count=%llu total_gpu_roundtrip_ns=%llu total_gpu_roundtrip_s=%.6f avg_gpu_roundtrip_us=%.3f max_gpu_roundtrip_us=%.3f%s\n",
        roundTripActiveChannels, (unsigned long long)roundTripSumCount,
        (unsigned long long)roundTripSumNs, roundTripTotalS, roundTripAvgUs, roundTripMaxUs,
        roundTripChannelSummary);
-  INFO(NCCL_NET, "RING_PRIM summary ring_prim_path=1%s", primSummary);
+  fprintf(stderr, "NCCL INFO RING_PRIM summary ring_prim_path=1%s\n", primSummary);
 
 
   for (int slot = 0; slot < NCCL_RING_PRIM_OP_STATS_MAX; slot++) {
@@ -623,8 +623,8 @@ static void ncclRingIbStagingCopySummary() {
       opSyncPos += (size_t)written;
     }
 
-    INFO(NCCL_NET,
-         "RING_OP summary op_slot=%d func=%s msg_bytes=%llu channelLo=%llu channelHi=%llu staging={active=%d,c=%llu,bytes=%llu,sum_s=%.6f,avg_ch_s=%.6f,max_ch_s=%.6f,avg_us=%.3f}%s",
+    fprintf(stderr,
+         "NCCL INFO RING_OP summary op_slot=%d func=%s msg_bytes=%llu channelLo=%llu channelHi=%llu staging={active=%d,c=%llu,bytes=%llu,sum_s=%.6f,avg_ch_s=%.6f,max_ch_s=%.6f,avg_us=%.3f}%s\n",
          slot, func < NCCL_NUM_FUNCTIONS ? ncclFuncStr[func] : "Unknown", (unsigned long long)bytes,
          (unsigned long long)channelLo, (unsigned long long)channelHi,
          stagingOpActiveChannels, (unsigned long long)stagingOpCount, (unsigned long long)stagingOpBytes,
