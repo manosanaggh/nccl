@@ -138,6 +138,8 @@ NCCL_PARAM(IbMeasureSendMinBytes, "IB_MEASURE_SEND_MIN_BYTES", 0);
 NCCL_PARAM(IbMeasureSendIdleNvtx, "IB_MEASURE_SEND_IDLE_NVTX", 0);
 NCCL_PARAM(IbMeasureSendKernelOverlap, "IB_MEASURE_SEND_KERNEL_OVERLAP", 0);
 NCCL_PARAM(IbMeasureSendKernelOverlapCallbacks, "IB_MEASURE_SEND_KERNEL_OVERLAP_CALLBACKS", 0);
+NCCL_PARAM(MeasureIterStart, "MEASURE_ITER_START", -1);
+NCCL_PARAM(MeasureIterEnd, "MEASURE_ITER_END", -1);
 NCCL_PARAM(CodepathTrace, "CODEPATH_TRACE", 0);
 NCCL_PARAM(CodepathTraceLimit, "CODEPATH_TRACE_LIMIT", 64);
 NCCL_PARAM(CodepathTraceMinBytes, "CODEPATH_TRACE_MIN_BYTES", 0);
@@ -152,6 +154,27 @@ NCCL_PARAM(IbDataDirect,"IB_DATA_DIRECT",1);
 static std::atomic<uint64_t> ncclIbMeasureSendLogCount{0};
 static std::atomic<uint64_t> ncclIbMeasureSendStartLogCount{0};
 static std::atomic<uint64_t> ncclCodepathTraceCount{0};
+static std::atomic<int> ncclMeasureTrainingIteration{-1};
+
+extern "C" __attribute__((visibility("default"))) void ncclMeasureSetTrainingIteration(int iteration) {
+  ncclMeasureTrainingIteration.store(iteration, std::memory_order_relaxed);
+}
+
+int ncclMeasureCurrentIteration() {
+  return ncclMeasureTrainingIteration.load(std::memory_order_relaxed);
+}
+
+bool ncclMeasureIterationAllowed() {
+  int64_t start = ncclParamMeasureIterStart();
+  int64_t end = ncclParamMeasureIterEnd();
+  if (start < 0 && end < 0) return true;
+
+  int iteration = ncclMeasureCurrentIteration();
+  if (iteration < 0) return false;
+  if (start >= 0 && iteration < start) return false;
+  if (end >= 0 && iteration > end) return false;
+  return true;
+}
 static std::mutex ncclIbMeasureSendIdleMutex;
 static uint64_t ncclIbMeasureSendIdleOutstanding = 0;
 static uint64_t ncclIbMeasureSendIdleStartNs = 0;
@@ -1306,7 +1329,12 @@ struct ncclIbRequest {
 };
 
 static inline void ncclIbMeasureSendStart(struct ncclIbRequest* req, uint64_t bytes) {
-  if (!ncclIbMeasureSendTrackingEnabled()) return;
+  if (!ncclIbMeasureSendTrackingEnabled() || !ncclMeasureIterationAllowed()) {
+    req->measureStartNs = 0;
+    req->measurePostDoneNs = 0;
+    req->measureBytes = 0;
+    return;
+  }
   req->measureStartNs = ncclIbMeasureSendNowNs();
   req->measurePostDoneNs = 0;
   req->measureBytes = bytes;
@@ -1374,7 +1402,7 @@ static inline int ncclIbRequestDone(struct ncclIbRequest* req) {
 }
 
 static inline void ncclIbMeasureSendLogStart(struct ncclIbRequest** reqs, int nreqs, int slot, int tag) {
-  if (!ncclParamIbMeasureSend() || ncclParamIbMeasureSendLogEvery() <= 0) return;
+  if (!ncclParamIbMeasureSend() || ncclParamIbMeasureSendLogEvery() <= 0 || !ncclMeasureIterationAllowed()) return;
   uint64_t sample = ncclIbMeasureSendStartLogCount.fetch_add(1, std::memory_order_relaxed) + 1;
   if (sample > 16) return;
 

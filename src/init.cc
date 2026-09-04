@@ -810,9 +810,14 @@ static ncclResult_t devCommSetup(ncclComm_t comm) {
   tmpCommAndChans.comm.measureRingPrims = ncclParamDeviceMeasureRingPrims() != 0;
   tmpCommAndChans.comm.measureRingPrimsLogEvery = std::max<int64_t>(1, ncclParamDeviceMeasureRingPrimsLogEvery());
   tmpCommAndChans.comm.measureRingPrimsMinBytes = std::max<int64_t>(0, ncclParamDeviceMeasureRingPrimsMinBytes());
+  tmpCommAndChans.comm.measureRingPrimsEnabled = NULL;
   tmpCommAndChans.comm.measureRingPrimsStats = NULL;
+  comm->measureRingPrimsEnabled = NULL;
   comm->measureRingPrimsStats = NULL;
   if (tmpCommAndChans.comm.measureRingPrims) {
+    NCCLCHECKGOTO(ncclCudaCallocAsync(&comm->measureRingPrimsEnabled, 1, deviceStream), ret, fail);
+    ncclCommPushCudaFree(comm, comm->measureRingPrimsEnabled);
+    tmpCommAndChans.comm.measureRingPrimsEnabled = comm->measureRingPrimsEnabled;
     NCCLCHECKGOTO(ncclCudaCallocAsync(&comm->measureRingPrimsStats, NCCL_RING_PRIM_STATS_LEN, deviceStream), ret, fail);
     ncclCommPushCudaFree(comm, comm->measureRingPrimsStats);
     tmpCommAndChans.comm.measureRingPrimsStats = comm->measureRingPrimsStats;

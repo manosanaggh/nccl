@@ -19,8 +19,11 @@
 #endif
 
 #if NCCL_DEVICE_MEASURE_RING_PRIMS
+#define NCCL_RING_MEASURE_ACTIVE() \
+  (ncclShmem.comm.measureRingPrims && ncclShmem.comm.measureRingPrimsStats != nullptr && \
+   ncclShmem.comm.measureRingPrimsEnabled != nullptr && *ncclShmem.comm.measureRingPrimsEnabled)
 #define NCCL_RING_KERNEL_CHANNEL_MEASURE_START(_tid) \
-  (((_tid) == 0 && ncclShmem.comm.measureRingPrims && ncclShmem.comm.measureRingPrimsStats != nullptr) ? globaltimer() : 0ULL)
+  (((_tid) == 0 && NCCL_RING_MEASURE_ACTIVE()) ? globaltimer() : 0ULL)
 #define NCCL_RING_OP_MEASURE_VALID(_work) \
   ((_work) != nullptr && (_work)->measureOpSlot < NCCL_RING_PRIM_OP_STATS_MAX)
 #define NCCL_RING_OP_MEASURE_META(_work) do { \
@@ -34,7 +37,7 @@
   } \
 } while (0)
 #define NCCL_RING_KERNEL_CHANNEL_MEASURE_END(_tid, _start, _work) do { \
-  if ((_tid) == 0 && ncclShmem.comm.measureRingPrims && ncclShmem.comm.measureRingPrimsStats != nullptr && (_start) != 0ULL) { \
+  if ((_tid) == 0 && NCCL_RING_MEASURE_ACTIVE() && (_start) != 0ULL) { \
     unsigned long long __ncclRingKernelChannelEnd = globaltimer(); \
     atomicAdd((unsigned long long*)(ncclShmem.comm.measureRingPrimsStats + NCCL_RING_PRIM_STATS_KERNEL_CHANNEL_COUNT), 1ULL); \
     atomicAdd((unsigned long long*)(ncclShmem.comm.measureRingPrimsStats + NCCL_RING_PRIM_STATS_KERNEL_CHANNEL_NS), __ncclRingKernelChannelEnd - (unsigned long long)(_start)); \
@@ -42,9 +45,9 @@
   } \
 } while (0)
 #define NCCL_RING_SYNC_MEASURE_START(_enabled) \
-  (((_enabled) && ncclShmem.comm.measureRingPrims && ncclShmem.comm.measureRingPrimsStats != nullptr) ? globaltimer() : 0ULL)
+  (((_enabled) && NCCL_RING_MEASURE_ACTIVE()) ? globaltimer() : 0ULL)
 #define NCCL_RING_SYNC_MEASURE_END(_enabled, _syncId, _start, _work) do { \
-  if ((_enabled) && ncclShmem.comm.measureRingPrims && ncclShmem.comm.measureRingPrimsStats != nullptr && (_start) != 0ULL) { \
+  if ((_enabled) && NCCL_RING_MEASURE_ACTIVE() && (_start) != 0ULL) { \
     unsigned long long __ncclRingSyncEnd = globaltimer(); \
     unsigned long long __ncclRingSyncNs = __ncclRingSyncEnd - (unsigned long long)(_start); \
     int __ncclRingSyncBase = NCCL_RING_PRIM_STATS_SYNC_BASE + ((int)(_syncId)) * NCCL_RING_PRIM_STATS_SYNC_FIELDS; \
@@ -64,9 +67,9 @@
   } \
 } while (0)
 #define NCCL_RING_PRIM_MEASURE_START(_tid) \
-  (((_tid) == 0 && ncclShmem.comm.measureRingPrims && ncclShmem.comm.measureRingPrimsStats != nullptr) ? globaltimer() : 0ULL)
+  (((_tid) == 0 && NCCL_RING_MEASURE_ACTIVE()) ? globaltimer() : 0ULL)
 #define NCCL_RING_PRIM_MEASURE_END_IF(_net, _tid, _primId, _elemOffset, _chunkCount, _nelem, _typeSize, _start) do { \
-  if ((_tid) == 0 && ncclShmem.comm.measureRingPrims && ncclShmem.comm.measureRingPrimsStats != nullptr && (_start) != 0ULL) { \
+  if ((_tid) == 0 && NCCL_RING_MEASURE_ACTIVE() && (_start) != 0ULL) { \
     unsigned long long __ncclRingPrimBytes = (unsigned long long)(_nelem) * (unsigned long long)(_typeSize); \
     if (__ncclRingPrimBytes >= ncclShmem.comm.measureRingPrimsMinBytes) { \
       unsigned long long __ncclRingPrimEnd = globaltimer(); \
@@ -86,9 +89,9 @@
 #define NCCL_RING_PRIM_MEASURE_END(_tid, _primId, _elemOffset, _chunkCount, _nelem, _typeSize, _start) \
   NCCL_RING_PRIM_MEASURE_END_IF(0, _tid, _primId, _elemOffset, _chunkCount, _nelem, _typeSize, _start)
 #define NCCL_RING_IB_STAGING_COPY_MEASURE_START(_enabled, _tid) \
-  (((_enabled) && (_tid) == 0 && ncclShmem.comm.measureRingPrims && ncclShmem.comm.measureRingPrimsStats != nullptr) ? globaltimer() : 0ULL)
+  (((_enabled) && (_tid) == 0 && NCCL_RING_MEASURE_ACTIVE()) ? globaltimer() : 0ULL)
 #define NCCL_RING_IB_STAGING_COPY_MEASURE_END(_enabled, _tid, _prim, _nelem, _typeSize, _start, _work) do { \
-  if ((_enabled) && (_tid) == 0 && ncclShmem.comm.measureRingPrims && ncclShmem.comm.measureRingPrimsStats != nullptr && (_start) != 0ULL) { \
+  if ((_enabled) && (_tid) == 0 && NCCL_RING_MEASURE_ACTIVE() && (_start) != 0ULL) { \
     unsigned long long __ncclRingStagingBytes = (unsigned long long)(_nelem) * (unsigned long long)(_typeSize); \
     if (__ncclRingStagingBytes >= ncclShmem.comm.measureRingPrimsMinBytes) { \
       unsigned long long __ncclRingStagingEnd = globaltimer(); \
@@ -113,7 +116,7 @@
   } \
 } while (0)
 #define NCCL_RING_SEND_ROUNDTRIP_MEASURE_END(_enabled, _start) do { \
-  if ((_enabled) && ncclShmem.comm.measureRingPrims && ncclShmem.comm.measureRingPrimsStats != nullptr && (_start) != 0ULL) { \
+  if ((_enabled) && NCCL_RING_MEASURE_ACTIVE() && (_start) != 0ULL) { \
     unsigned long long __ncclRingRtEnd = globaltimer(); \
     unsigned long long __ncclRingRtNs = __ncclRingRtEnd - (unsigned long long)(_start); \
     int __ncclRingRtChannel = ncclShmem.channelId; \

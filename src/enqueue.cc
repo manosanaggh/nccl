@@ -1651,7 +1651,13 @@ ncclResult_t ncclLaunchKernel(struct ncclComm* comm, struct ncclKernelPlan* plan
     CU_LAUNCH_PARAM_END
   };
 
-  bool measureKernelOverlap = ncclIbMeasureSendKernelOverlapEnabled() && !ncclCudaGraphValid(planner->capturingGraph) && planHasMeasureAgRsWork(plan);
+  bool hasMeasureAgRsWork = planHasMeasureAgRsWork(plan);
+  bool measureIterationAllowed = ncclMeasureIterationAllowed();
+  if (comm->measureRingPrimsEnabled != NULL) {
+    CUDACHECKGOTO(cudaMemsetAsync(comm->measureRingPrimsEnabled, (hasMeasureAgRsWork && measureIterationAllowed) ? 1 : 0, sizeof(int), launchStream), ret, do_return);
+  }
+
+  bool measureKernelOverlap = ncclIbMeasureSendKernelOverlapEnabled() && !ncclCudaGraphValid(planner->capturingGraph) && hasMeasureAgRsWork && measureIterationAllowed;
   bool measureKernelOverlapCallbacks = measureKernelOverlap && ncclIbMeasureSendKernelOverlapCallbacksEnabled();
   bool measureKernelActiveStarted = false;
   bool measureKernelActiveEndQueued = false;

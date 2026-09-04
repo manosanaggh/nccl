@@ -481,6 +481,7 @@ struct ncclKernelComm {
   int measureRingPrims;
   uint64_t measureRingPrimsLogEvery;
   uint64_t measureRingPrimsMinBytes;
+  int* measureRingPrimsEnabled;
   uint64_t* measureRingPrimsStats;
 
   int* collNetDenseToUserRank;

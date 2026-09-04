@@ -559,6 +559,7 @@ struct ncclComm {
 
   // Device side of the communicator (for cudaFree's)
   struct ncclKernelComm* devComm; // actually = &ncclKernelCommAndChannels::comm
+  int* measureRingPrimsEnabled;
   uint64_t* measureRingPrimsStats;
 
   uint32_t workArgsBytes; // max size of kernel args
