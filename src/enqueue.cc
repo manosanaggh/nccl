@@ -1653,10 +1653,6 @@ ncclResult_t ncclLaunchKernel(struct ncclComm* comm, struct ncclKernelPlan* plan
 
   bool hasMeasureAgRsWork = planHasMeasureAgRsWork(plan);
   bool measureIterationAllowed = ncclMeasureIterationAllowed();
-  if (comm->measureRingPrimsEnabled != NULL) {
-    CUDACHECKGOTO(cudaMemsetAsync(comm->measureRingPrimsEnabled, (hasMeasureAgRsWork && measureIterationAllowed) ? 1 : 0, sizeof(int), launchStream), ret, do_return);
-  }
-
   bool measureKernelOverlap = ncclIbMeasureSendKernelOverlapEnabled() && !ncclCudaGraphValid(planner->capturingGraph) && hasMeasureAgRsWork && measureIterationAllowed;
   bool measureKernelOverlapCallbacks = measureKernelOverlap && ncclIbMeasureSendKernelOverlapCallbacksEnabled();
   bool measureKernelActiveStarted = false;
@@ -1671,6 +1667,10 @@ ncclResult_t ncclLaunchKernel(struct ncclComm* comm, struct ncclKernelPlan* plan
 
   CUfunction fn;
   CUDACHECKGOTO(cudaGetFuncBySymbol(&fn, sym), ret, do_return);
+
+  if (comm->measureRingPrimsEnabled != NULL) {
+    CUDACHECKGOTO(cudaMemsetAsync(comm->measureRingPrimsEnabled, (hasMeasureAgRsWork && measureIterationAllowed) ? 1 : 0, sizeof(int), launchStream), ret, do_return);
+  }
 
   if (CUDART_VERSION >= 11080 && driverVersion >= 11080) {
   #if CUDART_VERSION >= 11080
