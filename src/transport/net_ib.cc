@@ -134,6 +134,7 @@ NCCL_PARAM(IbSl, "IB_SL", -1);
 NCCL_PARAM(IbTc, "IB_TC", -1);
 NCCL_PARAM(IbMeasureSend, "IB_MEASURE_SEND", 0);
 NCCL_PARAM(IbMeasureSendMinBytes, "IB_MEASURE_SEND_MIN_BYTES", 0);
+NCCL_PARAM(IbMeasureSendOutstandingIntervalUs, "IB_MEASURE_SEND_OUTSTANDING_INTERVAL_US", 0);
 NCCL_PARAM(IbMeasureSendIdleNvtx, "IB_MEASURE_SEND_IDLE_NVTX", 0);
 NCCL_PARAM(IbMeasureSendKernelOverlap, "IB_MEASURE_SEND_KERNEL_OVERLAP", 0);
 NCCL_PARAM(IbMeasureSendKernelOverlapCallbacks, "IB_MEASURE_SEND_KERNEL_OVERLAP_CALLBACKS", 0);
@@ -191,6 +192,15 @@ static uint64_t ncclIbMeasureSendKernelActiveNs = 0;
 static uint64_t ncclIbMeasureSendKernelActiveCount = 0;
 static uint64_t ncclIbMeasureSendKernelActiveEntries = 0;
 static uint64_t ncclIbMeasureSendLastStateNs = 0;
+static uint64_t ncclIbMeasureSendOutstandingBucketStartNs = 0;
+static uint64_t ncclIbMeasureSendOutstandingBucketUsedNs = 0;
+static uint64_t ncclIbMeasureSendOutstandingBucketWeightedNs = 0;
+static uint64_t ncclIbMeasureSendOutstandingIntervalCount = 0;
+static uint64_t ncclIbMeasureSendOutstandingZeroIntervalCount = 0;
+static uint64_t ncclIbMeasureSendOutstandingObservedNs = 0;
+static uint64_t ncclIbMeasureSendOutstandingWeightedNs = 0;
+static double ncclIbMeasureSendOutstandingBucketAvgSum = 0.0;
+static double ncclIbMeasureSendOutstandingMaxBucketAvg = 0.0;
 static nvtxRangeId_t ncclIbMeasureSendIdleNvtxRange = 0;
 
 static inline uint64_t ncclIbMeasureSendNowNs() {
@@ -311,11 +321,60 @@ bool ncclCodepathTraceTake(uint64_t bytes) {
   return sample < (uint64_t)limit;
 }
 
-static inline bool ncclIbMeasureSendTrackingEnabled() {
-  return ncclParamIbMeasureSend() || ncclParamIbMeasureSendIdleNvtx() || ncclIbMeasureSendKernelOverlapEnabled();
+static inline bool ncclIbMeasureSendOutstandingIntervalEnabled() {
+  return ncclParamIbMeasureSendOutstandingIntervalUs() > 0;
 }
 
-static inline void ncclIbMeasureSendAccountStateLocked(uint64_t eventNs) {
+static inline bool ncclIbMeasureSendTrackingEnabled() {
+  return ncclParamIbMeasureSend() || ncclIbMeasureSendOutstandingIntervalEnabled() ||
+      ncclParamIbMeasureSendIdleNvtx() || ncclIbMeasureSendKernelOverlapEnabled();
+}
+
+static inline uint64_t ncclIbMeasureSendOutstandingIntervalNs() {
+  int64_t intervalUs = ncclParamIbMeasureSendOutstandingIntervalUs();
+  return intervalUs <= 0 ? 0 : (uint64_t)intervalUs * 1000ULL;
+}
+
+static inline void ncclIbMeasureSendOutstandingCommitBucketLocked() {
+  if (ncclIbMeasureSendOutstandingBucketUsedNs == 0) return;
+  double avg = (double)ncclIbMeasureSendOutstandingBucketWeightedNs /
+      (double)ncclIbMeasureSendOutstandingBucketUsedNs;
+  ncclIbMeasureSendOutstandingIntervalCount++;
+  ncclIbMeasureSendOutstandingObservedNs += ncclIbMeasureSendOutstandingBucketUsedNs;
+  ncclIbMeasureSendOutstandingWeightedNs += ncclIbMeasureSendOutstandingBucketWeightedNs;
+  ncclIbMeasureSendOutstandingBucketAvgSum += avg;
+  if (avg == 0.0) ncclIbMeasureSendOutstandingZeroIntervalCount++;
+  if (avg > ncclIbMeasureSendOutstandingMaxBucketAvg) ncclIbMeasureSendOutstandingMaxBucketAvg = avg;
+  ncclIbMeasureSendOutstandingBucketUsedNs = 0;
+  ncclIbMeasureSendOutstandingBucketWeightedNs = 0;
+}
+
+static inline void ncclIbMeasureSendOutstandingAccountLocked(uint64_t startNs, uint64_t endNs, uint64_t outstanding) {
+  uint64_t intervalNs = ncclIbMeasureSendOutstandingIntervalNs();
+  if (intervalNs == 0 || endNs <= startNs) return;
+  if (ncclIbMeasureSendOutstandingBucketStartNs == 0) ncclIbMeasureSendOutstandingBucketStartNs = startNs;
+
+  uint64_t cursorNs = startNs;
+  while (cursorNs < endNs) {
+    uint64_t bucketEndNs = ncclIbMeasureSendOutstandingBucketStartNs + intervalNs;
+    if (cursorNs >= bucketEndNs) {
+      ncclIbMeasureSendOutstandingCommitBucketLocked();
+      ncclIbMeasureSendOutstandingBucketStartNs = bucketEndNs;
+      continue;
+    }
+    uint64_t chunkEndNs = endNs < bucketEndNs ? endNs : bucketEndNs;
+    uint64_t dt = chunkEndNs - cursorNs;
+    ncclIbMeasureSendOutstandingBucketUsedNs += dt;
+    ncclIbMeasureSendOutstandingBucketWeightedNs += outstanding * dt;
+    cursorNs = chunkEndNs;
+    if (cursorNs == bucketEndNs) {
+      ncclIbMeasureSendOutstandingCommitBucketLocked();
+      ncclIbMeasureSendOutstandingBucketStartNs = bucketEndNs;
+    }
+  }
+}
+
+static inline void ncclIbMeasureSendAccountStateLocked(uint64_t eventNs, bool accountOutstanding = true) {
   if (ncclIbMeasureSendLastStateNs == 0) {
     ncclIbMeasureSendLastStateNs = eventNs;
     return;
@@ -323,6 +382,9 @@ static inline void ncclIbMeasureSendAccountStateLocked(uint64_t eventNs) {
   if (eventNs < ncclIbMeasureSendLastStateNs) eventNs = ncclIbMeasureSendLastStateNs;
   uint64_t dt = eventNs - ncclIbMeasureSendLastStateNs;
   if (dt != 0) {
+    if (accountOutstanding) {
+      ncclIbMeasureSendOutstandingAccountLocked(ncclIbMeasureSendLastStateNs, eventNs, ncclIbMeasureSendIdleOutstanding);
+    }
     bool idle = ncclIbMeasureSendIdleOutstanding == 0 && ncclIbMeasureSendIdleStartNs != 0;
     bool kernelActive = ncclIbMeasureSendKernelActiveCount != 0;
     if (idle) {
@@ -358,7 +420,7 @@ static void ncclIbMeasureSendIdleSummary() {
   if (!ncclIbMeasureSendTrackingEnabled()) return;
   std::lock_guard<std::mutex> lock(ncclIbMeasureSendIdleMutex);
   uint64_t nowNs = ncclIbMeasureSendNowNs();
-  ncclIbMeasureSendAccountStateLocked(nowNs);
+  ncclIbMeasureSendAccountStateLocked(nowNs, false);
   uint64_t idleCount = ncclIbMeasureSendIdleCount +
       ((ncclIbMeasureSendIdleOutstanding == 0 && ncclIbMeasureSendIdleStartNs != 0) ? 1 : 0);
   uint64_t idleTotalNs = ncclIbMeasureSendIdleInsideKernelNs + ncclIbMeasureSendIdleOutsideKernelNs;
@@ -375,6 +437,26 @@ static void ncclIbMeasureSendIdleSummary() {
        insideS, outsideS, insidePct, outsidePct, kernelS,
        (unsigned long long)ncclIbMeasureSendKernelActiveEntries,
        (unsigned long long)ncclIbMeasureSendKernelActiveCount);
+}
+
+static void ncclIbMeasureSendOutstandingIntervalSummary() __attribute__((destructor));
+static void ncclIbMeasureSendOutstandingIntervalSummary() {
+  if (!ncclIbMeasureSendOutstandingIntervalEnabled()) return;
+  std::lock_guard<std::mutex> lock(ncclIbMeasureSendIdleMutex);
+  ncclIbMeasureSendOutstandingCommitBucketLocked();
+  uint64_t intervalUs = (uint64_t)ncclParamIbMeasureSendOutstandingIntervalUs();
+  uint64_t count = ncclIbMeasureSendOutstandingIntervalCount;
+  double observedS = (double)ncclIbMeasureSendOutstandingObservedNs / 1000000000.0;
+  double avgOutstanding = ncclIbMeasureSendOutstandingObservedNs == 0 ? 0.0 :
+      (double)ncclIbMeasureSendOutstandingWeightedNs / (double)ncclIbMeasureSendOutstandingObservedNs;
+  double avgBucketOutstanding = count == 0 ? 0.0 : ncclIbMeasureSendOutstandingBucketAvgSum / (double)count;
+  double zeroPct = count == 0 ? 0.0 : 100.0 *
+      (double)ncclIbMeasureSendOutstandingZeroIntervalCount / (double)count;
+  INFO(NCCL_NET,
+       "NET/IB: send measure outstanding interval summary interval_us=%llu intervals=%llu observed_s=%.6f avg_outstanding=%.3f avg_bucket_outstanding=%.3f max_bucket_avg_outstanding=%.3f zero_intervals=%llu zero_interval_pct=%.2f",
+       (unsigned long long)intervalUs, (unsigned long long)count, observedS, avgOutstanding,
+       avgBucketOutstanding, ncclIbMeasureSendOutstandingMaxBucketAvg,
+       (unsigned long long)ncclIbMeasureSendOutstandingZeroIntervalCount, zeroPct);
 }
 
 static void ncclIbMeasureSendSummary() __attribute__((destructor));
