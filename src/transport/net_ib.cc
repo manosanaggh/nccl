@@ -133,7 +133,6 @@ NCCL_PARAM(IbUseInline, "IB_USE_INLINE", 0);
 NCCL_PARAM(IbSl, "IB_SL", -1);
 NCCL_PARAM(IbTc, "IB_TC", -1);
 NCCL_PARAM(IbMeasureSend, "IB_MEASURE_SEND", 0);
-NCCL_PARAM(IbMeasureSendLogEvery, "IB_MEASURE_SEND_LOG_EVERY", 0);
 NCCL_PARAM(IbMeasureSendMinBytes, "IB_MEASURE_SEND_MIN_BYTES", 0);
 NCCL_PARAM(IbMeasureSendIdleNvtx, "IB_MEASURE_SEND_IDLE_NVTX", 0);
 NCCL_PARAM(IbMeasureSendKernelOverlap, "IB_MEASURE_SEND_KERNEL_OVERLAP", 0);
@@ -151,8 +150,11 @@ NCCL_PARAM(IbAsyncEvents,"IB_RETURN_ASYNC_EVENTS",1);
 NCCL_PARAM(IbEceEnable,"IB_ECE_ENABLE",1);
 NCCL_PARAM(IbDataDirect,"IB_DATA_DIRECT",1);
 
-static std::atomic<uint64_t> ncclIbMeasureSendLogCount{0};
-static std::atomic<uint64_t> ncclIbMeasureSendStartLogCount{0};
+static std::atomic<uint64_t> ncclIbMeasureSendSummaryCount{0};
+static std::atomic<uint64_t> ncclIbMeasureSendSummaryBytes{0};
+static std::atomic<uint64_t> ncclIbMeasureSendSummaryTotalNs{0};
+static std::atomic<uint64_t> ncclIbMeasureSendSummaryPostNs{0};
+static std::atomic<uint64_t> ncclIbMeasureSendSummaryCqWaitNs{0};
 static std::atomic<uint64_t> ncclCodepathTraceCount{0};
 static std::atomic<int> ncclMeasureTrainingIteration{-1};
 
@@ -371,6 +373,29 @@ static void ncclIbMeasureSendIdleSummary() {
        insideS, outsideS, insidePct, outsidePct, kernelS,
        (unsigned long long)ncclIbMeasureSendKernelActiveEntries,
        (unsigned long long)ncclIbMeasureSendKernelActiveCount);
+}
+
+static void ncclIbMeasureSendSummary() __attribute__((destructor));
+static void ncclIbMeasureSendSummary() {
+  if (!ncclParamIbMeasureSend()) return;
+  uint64_t count = ncclIbMeasureSendSummaryCount.load(std::memory_order_relaxed);
+  uint64_t bytes = ncclIbMeasureSendSummaryBytes.load(std::memory_order_relaxed);
+  uint64_t totalNs = ncclIbMeasureSendSummaryTotalNs.load(std::memory_order_relaxed);
+  uint64_t postNs = ncclIbMeasureSendSummaryPostNs.load(std::memory_order_relaxed);
+  uint64_t cqWaitNs = ncclIbMeasureSendSummaryCqWaitNs.load(std::memory_order_relaxed);
+  double totalS = (double)totalNs / 1000000000.0;
+  double postS = (double)postNs / 1000000000.0;
+  double cqWaitS = (double)cqWaitNs / 1000000000.0;
+  double avgBytes = count == 0 ? 0.0 : (double)bytes / (double)count;
+  double avgTotalUs = count == 0 ? 0.0 : (double)totalNs / (double)count / 1000.0;
+  double avgPostUs = count == 0 ? 0.0 : (double)postNs / (double)count / 1000.0;
+  double avgCqWaitUs = count == 0 ? 0.0 : (double)cqWaitNs / (double)count / 1000.0;
+  double throughputGBps = totalNs == 0 ? 0.0 : (double)bytes / (double)totalNs;
+  double cqThroughputGBps = cqWaitNs == 0 ? 0.0 : (double)bytes / (double)cqWaitNs;
+  INFO(NCCL_NET,
+       "NET/IB: send measure summary count=%llu bytes=%llu total_s=%.6f post_s=%.6f cq_wait_s=%.6f avg_bytes=%.3f avg_total_us=%.3f avg_post_us=%.3f avg_cq_wait_us=%.3f throughput_GBps=%.3f cq_throughput_GBps=%.3f",
+       (unsigned long long)count, (unsigned long long)bytes, totalS, postS, cqWaitS, avgBytes, avgTotalUs,
+       avgPostUs, avgCqWaitUs, throughputGBps, cqThroughputGBps);
 }
 
 static ncclResult_t ncclIbStatsInit(struct ncclIbStats* stat) {
@@ -1401,25 +1426,6 @@ static inline int ncclIbRequestDone(struct ncclIbRequest* req) {
   return req->events[0] == 0 && req->events[1] == 0 && req->events[2] == 0 && req->events[3] == 0;
 }
 
-static inline void ncclIbMeasureSendLogStart(struct ncclIbRequest** reqs, int nreqs, int slot, int tag) {
-  if (!ncclParamIbMeasureSend() || ncclParamIbMeasureSendLogEvery() <= 0 || !ncclMeasureIterationAllowed()) return;
-  uint64_t sample = ncclIbMeasureSendStartLogCount.fetch_add(1, std::memory_order_relaxed) + 1;
-  if (sample > 16) return;
-
-  uint64_t totalBytes = 0;
-  int validReqs = 0;
-  for (int i = 0; i < nreqs; i++) {
-    if (reqs[i] != NULL) {
-      totalBytes += reqs[i]->measureBytes;
-      validReqs++;
-    }
-  }
-  INFO(NCCL_NET,
-       "NET/IB: send measure start sample=%llu slot=%d tag=%x nreqs=%d validReqs=%d total_bytes=%llu first_bytes=%llu",
-       (unsigned long long)sample, slot, tag, nreqs, validReqs, (unsigned long long)totalBytes,
-       (unsigned long long)((nreqs > 0 && reqs[0] != NULL) ? reqs[0]->measureBytes : 0));
-}
-
 static inline void ncclIbMeasureSendComplete(struct ncclIbRequest* req, const char* path) {
   if (!ncclIbMeasureSendTrackingEnabled() || req->measureStartNs == 0) return;
   uint64_t bytes = req->measureBytes;
@@ -1435,20 +1441,13 @@ static inline void ncclIbMeasureSendComplete(struct ncclIbRequest* req, const ch
 
   ncclIbMeasureSendIdleEvent(path, completeNs, -1);
 
-  int64_t logEvery = ncclParamIbMeasureSendLogEvery();
-  if (logEvery <= 0) return;
-  uint64_t sample = ncclIbMeasureSendLogCount.fetch_add(1, std::memory_order_relaxed) + 1;
-  if ((sample % (uint64_t)logEvery) != 0) return;
-
-  double totalUs = (double)totalNs / 1000.0;
-  double postUs = (double)postNs / 1000.0;
-  double cqWaitUs = (double)cqWaitNs / 1000.0;
-  double throughputGBps = totalNs == 0 ? 0.0 : (double)bytes / (double)totalNs;
-  double cqThroughputGBps = cqWaitNs == 0 ? 0.0 : (double)bytes / (double)cqWaitNs;
-  INFO(NCCL_NET,
-       "NET/IB: send measure path=%s sample=%llu req=%p comm=%p type=%s bytes=%llu total_us=%.3f post_us=%.3f cq_wait_us=%.3f throughput_GBps=%.3f cq_throughput_GBps=%.3f nreqs=%d",
-       path, (unsigned long long)sample, req, req->base, reqTypeStr[req->type], (unsigned long long)bytes, totalUs,
-       postUs, cqWaitUs, throughputGBps, cqThroughputGBps, req->nreqs);
+  if (ncclParamIbMeasureSend()) {
+    ncclIbMeasureSendSummaryCount.fetch_add(1, std::memory_order_relaxed);
+    ncclIbMeasureSendSummaryBytes.fetch_add(bytes, std::memory_order_relaxed);
+    ncclIbMeasureSendSummaryTotalNs.fetch_add(totalNs, std::memory_order_relaxed);
+    ncclIbMeasureSendSummaryPostNs.fetch_add(postNs, std::memory_order_relaxed);
+    ncclIbMeasureSendSummaryCqWaitNs.fetch_add(cqWaitNs, std::memory_order_relaxed);
+  }
 }
 
 struct ncclIbNetCommDevBase {
@@ -2678,7 +2677,6 @@ ncclResult_t ncclIbIsend(void* sendComm, void* data, size_t size, int tag, void*
           reqs[i]->measureBytes = reqs[i]->send.size;
         }
       }
-      ncclIbMeasureSendLogStart(reqs, nreqs, slot, tag);
     }
 
     TIME_START(0);
