@@ -155,6 +155,8 @@ static std::atomic<uint64_t> ncclIbMeasureSendSummaryBytes{0};
 static std::atomic<uint64_t> ncclIbMeasureSendSummaryTotalNs{0};
 static std::atomic<uint64_t> ncclIbMeasureSendSummaryPostNs{0};
 static std::atomic<uint64_t> ncclIbMeasureSendSummaryCqWaitNs{0};
+static constexpr int ncclIbMeasureSendSummaryBucketCount = 26;
+static std::atomic<uint64_t> ncclIbMeasureSendSummaryThroughputBuckets[ncclIbMeasureSendSummaryBucketCount] = {};
 static std::atomic<uint64_t> ncclCodepathTraceCount{0};
 static std::atomic<int> ncclMeasureTrainingIteration{-1};
 
@@ -392,10 +394,29 @@ static void ncclIbMeasureSendSummary() {
   double avgCqWaitUs = count == 0 ? 0.0 : (double)cqWaitNs / (double)count / 1000.0;
   double throughputGBps = totalNs == 0 ? 0.0 : (double)bytes / (double)totalNs;
   double cqThroughputGBps = cqWaitNs == 0 ? 0.0 : (double)bytes / (double)cqWaitNs;
+  uint64_t buckets[ncclIbMeasureSendSummaryBucketCount];
+  for (int i = 0; i < ncclIbMeasureSendSummaryBucketCount; ++i) {
+    buckets[i] = ncclIbMeasureSendSummaryThroughputBuckets[i].load(std::memory_order_relaxed);
+  }
   INFO(NCCL_NET,
        "NET/IB: send measure summary count=%llu bytes=%llu total_s=%.6f post_s=%.6f cq_wait_s=%.6f avg_bytes=%.3f avg_total_us=%.3f avg_post_us=%.3f avg_cq_wait_us=%.3f throughput_GBps=%.3f cq_throughput_GBps=%.3f",
        (unsigned long long)count, (unsigned long long)bytes, totalS, postS, cqWaitS, avgBytes, avgTotalUs,
        avgPostUs, avgCqWaitUs, throughputGBps, cqThroughputGBps);
+  INFO(NCCL_NET,
+       "NET/IB: send measure throughput histogram total_GBps_floor buckets_0_to_25plus=0:%llu,1:%llu,2:%llu,3:%llu,4:%llu,5:%llu,6:%llu,7:%llu,8:%llu,9:%llu,10:%llu,11:%llu,12:%llu,13:%llu,14:%llu,15:%llu,16:%llu,17:%llu,18:%llu,19:%llu,20:%llu,21:%llu,22:%llu,23:%llu,24:%llu,25plus:%llu",
+       (unsigned long long)buckets[0], (unsigned long long)buckets[1],
+       (unsigned long long)buckets[2], (unsigned long long)buckets[3],
+       (unsigned long long)buckets[4], (unsigned long long)buckets[5],
+       (unsigned long long)buckets[6], (unsigned long long)buckets[7],
+       (unsigned long long)buckets[8], (unsigned long long)buckets[9],
+       (unsigned long long)buckets[10], (unsigned long long)buckets[11],
+       (unsigned long long)buckets[12], (unsigned long long)buckets[13],
+       (unsigned long long)buckets[14], (unsigned long long)buckets[15],
+       (unsigned long long)buckets[16], (unsigned long long)buckets[17],
+       (unsigned long long)buckets[18], (unsigned long long)buckets[19],
+       (unsigned long long)buckets[20], (unsigned long long)buckets[21],
+       (unsigned long long)buckets[22], (unsigned long long)buckets[23],
+       (unsigned long long)buckets[24], (unsigned long long)buckets[25]);
 }
 
 static ncclResult_t ncclIbStatsInit(struct ncclIbStats* stat) {
@@ -1447,6 +1468,11 @@ static inline void ncclIbMeasureSendComplete(struct ncclIbRequest* req, const ch
     ncclIbMeasureSendSummaryTotalNs.fetch_add(totalNs, std::memory_order_relaxed);
     ncclIbMeasureSendSummaryPostNs.fetch_add(postNs, std::memory_order_relaxed);
     ncclIbMeasureSendSummaryCqWaitNs.fetch_add(cqWaitNs, std::memory_order_relaxed);
+    double reqThroughputGBps = totalNs == 0 ? 0.0 : (double)bytes / (double)totalNs;
+    int bucket = (int)reqThroughputGBps;
+    if (bucket < 0) bucket = 0;
+    if (bucket >= ncclIbMeasureSendSummaryBucketCount) bucket = ncclIbMeasureSendSummaryBucketCount - 1;
+    ncclIbMeasureSendSummaryThroughputBuckets[bucket].fetch_add(1, std::memory_order_relaxed);
   }
 }
 
