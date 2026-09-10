@@ -2592,7 +2592,7 @@ ncclResult_t ncclIbMultiSend(struct ncclIbSendComm* comm, int slot) {
   int nqps = ncclParamIbSplitDataOnQps() ? comm->base.nqps : comm->base.nDataQps;
   uint64_t measurePostStartNs = 0;
   uint64_t measurePostDoneNs = 0;
-  bool measureSend = ncclIbMeasureSendTrackingEnabled();
+  bool measureSend = ncclIbMeasureSendTrackingEnabled() && ncclMeasureIterationAllowed();
   if (ncclCodepathTraceEnabled()) {
     uint64_t totalBytes = 0;
     int minBytes = nreqs == 0 ? 0 : reqs[0]->send.size;
@@ -2670,6 +2670,7 @@ ncclResult_t ncclIbMultiSend(struct ncclIbSendComm* comm, int slot) {
         for (int r=0; r<nreqs; r++) {
           reqs[r]->measureStartNs = measurePostStartNs;
           reqs[r]->measurePostDoneNs = 0;
+          reqs[r]->measureBytes = reqs[r]->send.size;
         }
       }
     }
