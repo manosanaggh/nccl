@@ -493,17 +493,15 @@ static void ncclIbMeasureSendSummary() {
   double avgTotalUs = count == 0 ? 0.0 : (double)totalNs / (double)count / 1000.0;
   double avgPostUs = count == 0 ? 0.0 : (double)postNs / (double)count / 1000.0;
   double avgCqWaitUs = count == 0 ? 0.0 : (double)cqWaitNs / (double)count / 1000.0;
-  double throughputGBps = totalNs == 0 ? 0.0 : (double)bytes / (double)totalNs;
-  double cqThroughputGBps = cqWaitNs == 0 ? 0.0 : (double)bytes / (double)cqWaitNs;
   double wallCqThroughputGBps = wallCqNs == 0 ? 0.0 : (double)bytes / (double)wallCqNs;
   uint64_t buckets[ncclIbMeasureSendSummaryBucketCount];
   for (int i = 0; i < ncclIbMeasureSendSummaryBucketCount; ++i) {
     buckets[i] = ncclIbMeasureSendSummaryThroughputBuckets[i].load(std::memory_order_relaxed);
   }
   INFO(NCCL_NET,
-       "NET/IB: send measure summary count=%llu bytes=%llu total_s=%.6f post_s=%.6f cq_wait_s=%.6f wall_cq_s=%.6f avg_bytes=%.3f avg_total_us=%.3f avg_post_us=%.3f avg_cq_wait_us=%.3f throughput_GBps=%.3f cq_throughput_GBps=%.3f wall_cq_throughput_GBps=%.3f",
+       "NET/IB: send measure summary count=%llu bytes=%llu total_s=%.6f post_s=%.6f cq_wait_s=%.6f wall_cq_s=%.6f avg_bytes=%.3f avg_total_us=%.3f avg_post_us=%.3f avg_cq_wait_us=%.3f wall_cq_throughput_GBps=%.3f",
        (unsigned long long)count, (unsigned long long)bytes, totalS, postS, cqWaitS, wallCqS, avgBytes, avgTotalUs,
-       avgPostUs, avgCqWaitUs, throughputGBps, cqThroughputGBps, wallCqThroughputGBps);
+       avgPostUs, avgCqWaitUs, wallCqThroughputGBps);
   INFO(NCCL_NET,
        "NET/IB: send measure throughput histogram total_GBps_floor buckets_0_to_25plus=0:%llu,1:%llu,2:%llu,3:%llu,4:%llu,5:%llu,6:%llu,7:%llu,8:%llu,9:%llu,10:%llu,11:%llu,12:%llu,13:%llu,14:%llu,15:%llu,16:%llu,17:%llu,18:%llu,19:%llu,20:%llu,21:%llu,22:%llu,23:%llu,24:%llu,25plus:%llu",
        (unsigned long long)buckets[0], (unsigned long long)buckets[1],
