@@ -1546,8 +1546,6 @@ static inline void ncclIbMeasureSendComplete(struct ncclIbRequest* req, const ch
   uint64_t startNs = req->measureStartNs;
   uint64_t postDoneNs = req->measurePostDoneNs;
   uint64_t totalNs = completeNs - startNs;
-  uint64_t postNs = postDoneNs == 0 ? 0 : postDoneNs - startNs;
-  uint64_t cqWaitNs = postDoneNs == 0 ? 0 : completeNs - postDoneNs;
   req->measureStartNs = 0;
   req->measurePostDoneNs = 0;
   if (!ncclIbMeasureSendIsTrackedBytes(bytes)) return;
