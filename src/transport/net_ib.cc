@@ -214,6 +214,21 @@ struct ncclIbMeasureKernelGpuEventPair {
   cudaEvent_t end;
 };
 
+struct ncclIbMeasureSendStateInterval {
+  uint64_t startNs;
+  uint64_t endNs;
+};
+
+struct ncclIbMeasureSendRequestLifetime {
+  uint64_t postDoneNs;
+  uint64_t completeNs;
+  uint64_t bytes;
+};
+
+static std::vector<struct ncclIbMeasureSendStateInterval> ncclIbMeasureSendActiveGe2Intervals;
+static std::mutex ncclIbMeasureSendRequestLifetimeMutex;
+static std::vector<struct ncclIbMeasureSendRequestLifetime> ncclIbMeasureSendRequestLifetimes;
+
 static std::mutex ncclIbMeasureKernelGpuEventMutex;
 static std::vector<struct ncclIbMeasureKernelGpuEventPair> ncclIbMeasureKernelGpuEvents;
 
@@ -399,7 +414,12 @@ static inline void ncclIbMeasureSendAccountStateLocked(uint64_t eventNs, bool ac
       ncclIbMeasureSendOutstandingAccountLocked(ncclIbMeasureSendLastStateNs, eventNs, ncclIbMeasureSendIdleOutstanding);
     }
     bool idle = ncclIbMeasureSendIdleOutstanding == 0 && ncclIbMeasureSendIdleStartNs != 0;
-    if (ncclIbMeasureSendIdleOutstanding >= 2) ncclIbMeasureSendActiveOutstandingGe2Ns += dt;
+    if (ncclIbMeasureSendIdleOutstanding >= 2) {
+      ncclIbMeasureSendActiveOutstandingGe2Ns += dt;
+      if (ncclParamIbMeasureSend()) {
+        ncclIbMeasureSendActiveGe2Intervals.push_back({ncclIbMeasureSendLastStateNs, eventNs});
+      }
+    }
     bool kernelActive = ncclIbMeasureSendKernelActiveCount != 0;
     if (idle) {
       if (kernelActive) {
@@ -473,27 +493,71 @@ static void ncclIbMeasureSendOutstandingIntervalSummary() {
        (unsigned long long)ncclIbMeasureSendOutstandingZeroIntervalCount, zeroPct);
 }
 
+static double ncclIbMeasureSendEstimateBytesInIntervals(
+    const std::vector<struct ncclIbMeasureSendRequestLifetime>& requests,
+    const std::vector<struct ncclIbMeasureSendStateInterval>& intervals) {
+  if (requests.empty() || intervals.empty()) return 0.0;
+
+  double bytes = 0.0;
+  size_t firstInterval = 0;
+  for (const auto& req : requests) {
+    if (req.completeNs <= req.postDoneNs) continue;
+    uint64_t reqDurationNs = req.completeNs - req.postDoneNs;
+    while (firstInterval < intervals.size() && intervals[firstInterval].endNs <= req.postDoneNs) firstInterval++;
+    for (size_t i = firstInterval; i < intervals.size() && intervals[i].startNs < req.completeNs; ++i) {
+      uint64_t startNs = std::max(req.postDoneNs, intervals[i].startNs);
+      uint64_t endNs = std::min(req.completeNs, intervals[i].endNs);
+      if (endNs > startNs) {
+        bytes += (double)req.bytes * (double)(endNs - startNs) / (double)reqDurationNs;
+      }
+    }
+  }
+  return bytes;
+}
+
 static void ncclIbMeasureSendSummary() __attribute__((destructor));
 static void ncclIbMeasureSendSummary() {
   if (!ncclParamIbMeasureSend()) return;
+  std::vector<struct ncclIbMeasureSendStateInterval> activeGe2Intervals;
+  uint64_t activeOutstandingGe2Ns = 0;
+  {
+    std::lock_guard<std::mutex> lock(ncclIbMeasureSendIdleMutex);
+    ncclIbMeasureSendAccountStateLocked(ncclIbMeasureSendNowNs());
+    activeOutstandingGe2Ns = ncclIbMeasureSendActiveOutstandingGe2Ns;
+    activeGe2Intervals = ncclIbMeasureSendActiveGe2Intervals;
+  }
+  std::vector<struct ncclIbMeasureSendRequestLifetime> requestLifetimes;
+  {
+    std::lock_guard<std::mutex> lock(ncclIbMeasureSendRequestLifetimeMutex);
+    requestLifetimes = ncclIbMeasureSendRequestLifetimes;
+  }
+  std::sort(activeGe2Intervals.begin(), activeGe2Intervals.end(),
+      [](const struct ncclIbMeasureSendStateInterval& a, const struct ncclIbMeasureSendStateInterval& b) {
+        return a.startNs < b.startNs;
+      });
+  std::sort(requestLifetimes.begin(), requestLifetimes.end(),
+      [](const struct ncclIbMeasureSendRequestLifetime& a, const struct ncclIbMeasureSendRequestLifetime& b) {
+        return a.postDoneNs < b.postDoneNs;
+      });
+  double activeOutstandingGe2EstimatedBytes = ncclIbMeasureSendEstimateBytesInIntervals(requestLifetimes, activeGe2Intervals);
   uint64_t count = ncclIbMeasureSendSummaryCount.load(std::memory_order_relaxed);
   uint64_t bytes = ncclIbMeasureSendSummaryBytes.load(std::memory_order_relaxed);
   uint64_t firstPostDoneNs = ncclIbMeasureSendSummaryFirstPostDoneNs.load(std::memory_order_relaxed);
   uint64_t lastCompleteNs = ncclIbMeasureSendSummaryLastCompleteNs.load(std::memory_order_relaxed);
   uint64_t wallCqNs = firstPostDoneNs == 0 || lastCompleteNs <= firstPostDoneNs ? 0 : lastCompleteNs - firstPostDoneNs;
-  uint64_t activeOutstandingGe2Ns = ncclIbMeasureSendActiveOutstandingGe2Ns;
   double wallCqS = (double)wallCqNs / 1000000000.0;
   double activeOutstandingGe2S = (double)activeOutstandingGe2Ns / 1000000000.0;
   double wallCqThroughputGBps = wallCqNs == 0 ? 0.0 : (double)bytes / (double)wallCqNs;
-  double activeOutstandingGe2ThroughputGBps = activeOutstandingGe2Ns == 0 ? 0.0 : (double)bytes / (double)activeOutstandingGe2Ns;
+  double activeOutstandingGe2ThroughputGBps = activeOutstandingGe2Ns == 0 ? 0.0 :
+      activeOutstandingGe2EstimatedBytes / (double)activeOutstandingGe2Ns;
   uint64_t buckets[ncclIbMeasureSendSummaryBucketCount];
   for (int i = 0; i < ncclIbMeasureSendSummaryBucketCount; ++i) {
     buckets[i] = ncclIbMeasureSendSummaryThroughputBuckets[i].load(std::memory_order_relaxed);
   }
   INFO(NCCL_NET,
-       "NET/IB: send measure summary count=%llu bytes=%llu wall_cq_s=%.6f active_outstanding_ge2_s=%.6f wall_cq_throughput_GBps=%.3f active_outstanding_ge2_throughput_GBps=%.3f",
+       "NET/IB: send measure summary count=%llu bytes=%llu wall_cq_s=%.6f active_outstanding_ge2_s=%.6f active_outstanding_ge2_est_bytes=%.3f wall_cq_throughput_GBps=%.3f active_outstanding_ge2_est_throughput_GBps=%.3f",
        (unsigned long long)count, (unsigned long long)bytes, wallCqS, activeOutstandingGe2S,
-       wallCqThroughputGBps, activeOutstandingGe2ThroughputGBps);
+       activeOutstandingGe2EstimatedBytes, wallCqThroughputGBps, activeOutstandingGe2ThroughputGBps);
   INFO(NCCL_NET,
        "NET/IB: send measure throughput histogram total_GBps_floor buckets_0_to_25plus=0:%llu,1:%llu,2:%llu,3:%llu,4:%llu,5:%llu,6:%llu,7:%llu,8:%llu,9:%llu,10:%llu,11:%llu,12:%llu,13:%llu,14:%llu,15:%llu,16:%llu,17:%llu,18:%llu,19:%llu,20:%llu,21:%llu,22:%llu,23:%llu,24:%llu,25plus:%llu",
        (unsigned long long)buckets[0], (unsigned long long)buckets[1],
@@ -1555,6 +1619,10 @@ static inline void ncclIbMeasureSendComplete(struct ncclIbRequest* req, const ch
   if (ncclParamIbMeasureSend()) {
     ncclIbMeasureSendSummaryCount.fetch_add(1, std::memory_order_relaxed);
     ncclIbMeasureSendSummaryBytes.fetch_add(bytes, std::memory_order_relaxed);
+    if (postDoneNs != 0 && completeNs > postDoneNs) {
+      std::lock_guard<std::mutex> lock(ncclIbMeasureSendRequestLifetimeMutex);
+      ncclIbMeasureSendRequestLifetimes.push_back({postDoneNs, completeNs, bytes});
+    }
     ncclIbMeasureSendAtomicMinNonZero(&ncclIbMeasureSendSummaryFirstPostDoneNs, postDoneNs);
     ncclIbMeasureSendAtomicMax(&ncclIbMeasureSendSummaryLastCompleteNs, completeNs);
     double reqThroughputGBps = totalNs == 0 ? 0.0 : (double)bytes / (double)totalNs;
