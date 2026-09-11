@@ -153,9 +153,6 @@ NCCL_PARAM(IbDataDirect,"IB_DATA_DIRECT",1);
 
 static std::atomic<uint64_t> ncclIbMeasureSendSummaryCount{0};
 static std::atomic<uint64_t> ncclIbMeasureSendSummaryBytes{0};
-static std::atomic<uint64_t> ncclIbMeasureSendSummaryTotalNs{0};
-static std::atomic<uint64_t> ncclIbMeasureSendSummaryPostNs{0};
-static std::atomic<uint64_t> ncclIbMeasureSendSummaryCqWaitNs{0};
 static std::atomic<uint64_t> ncclIbMeasureSendSummaryFirstPostDoneNs{0};
 static std::atomic<uint64_t> ncclIbMeasureSendSummaryLastCompleteNs{0};
 static constexpr int ncclIbMeasureSendSummaryBucketCount = 26;
@@ -188,7 +185,7 @@ static uint64_t ncclIbMeasureSendIdleStartNs = 0;
 static const char* ncclIbMeasureSendIdlePath = NULL;
 static uint64_t ncclIbMeasureSendIdleCount = 0;
 static uint64_t ncclIbMeasureSendIdleTotalNs = 0;
-static uint64_t ncclIbMeasureSendActiveOutstandingNs = 0;
+static uint64_t ncclIbMeasureSendActiveOutstandingGe2Ns = 0;
 static uint64_t ncclIbMeasureSendIdleInsideKernelNs = 0;
 static uint64_t ncclIbMeasureSendIdleOutsideKernelNs = 0;
 static uint64_t ncclIbMeasureSendKernelActiveNs = 0;
@@ -402,7 +399,7 @@ static inline void ncclIbMeasureSendAccountStateLocked(uint64_t eventNs, bool ac
       ncclIbMeasureSendOutstandingAccountLocked(ncclIbMeasureSendLastStateNs, eventNs, ncclIbMeasureSendIdleOutstanding);
     }
     bool idle = ncclIbMeasureSendIdleOutstanding == 0 && ncclIbMeasureSendIdleStartNs != 0;
-    if (ncclIbMeasureSendIdleOutstanding != 0) ncclIbMeasureSendActiveOutstandingNs += dt;
+    if (ncclIbMeasureSendIdleOutstanding >= 2) ncclIbMeasureSendActiveOutstandingGe2Ns += dt;
     bool kernelActive = ncclIbMeasureSendKernelActiveCount != 0;
     if (idle) {
       if (kernelActive) {
@@ -481,32 +478,22 @@ static void ncclIbMeasureSendSummary() {
   if (!ncclParamIbMeasureSend()) return;
   uint64_t count = ncclIbMeasureSendSummaryCount.load(std::memory_order_relaxed);
   uint64_t bytes = ncclIbMeasureSendSummaryBytes.load(std::memory_order_relaxed);
-  uint64_t totalNs = ncclIbMeasureSendSummaryTotalNs.load(std::memory_order_relaxed);
-  uint64_t postNs = ncclIbMeasureSendSummaryPostNs.load(std::memory_order_relaxed);
-  uint64_t cqWaitNs = ncclIbMeasureSendSummaryCqWaitNs.load(std::memory_order_relaxed);
   uint64_t firstPostDoneNs = ncclIbMeasureSendSummaryFirstPostDoneNs.load(std::memory_order_relaxed);
   uint64_t lastCompleteNs = ncclIbMeasureSendSummaryLastCompleteNs.load(std::memory_order_relaxed);
   uint64_t wallCqNs = firstPostDoneNs == 0 || lastCompleteNs <= firstPostDoneNs ? 0 : lastCompleteNs - firstPostDoneNs;
-  double totalS = (double)totalNs / 1000000000.0;
-  double postS = (double)postNs / 1000000000.0;
-  double cqWaitS = (double)cqWaitNs / 1000000000.0;
-  uint64_t activeOutstandingNs = ncclIbMeasureSendActiveOutstandingNs;
+  uint64_t activeOutstandingGe2Ns = ncclIbMeasureSendActiveOutstandingGe2Ns;
   double wallCqS = (double)wallCqNs / 1000000000.0;
-  double activeOutstandingS = (double)activeOutstandingNs / 1000000000.0;
-  double avgBytes = count == 0 ? 0.0 : (double)bytes / (double)count;
-  double avgTotalUs = count == 0 ? 0.0 : (double)totalNs / (double)count / 1000.0;
-  double avgPostUs = count == 0 ? 0.0 : (double)postNs / (double)count / 1000.0;
-  double avgCqWaitUs = count == 0 ? 0.0 : (double)cqWaitNs / (double)count / 1000.0;
+  double activeOutstandingGe2S = (double)activeOutstandingGe2Ns / 1000000000.0;
   double wallCqThroughputGBps = wallCqNs == 0 ? 0.0 : (double)bytes / (double)wallCqNs;
-  double activeOutstandingThroughputGBps = activeOutstandingNs == 0 ? 0.0 : (double)bytes / (double)activeOutstandingNs;
+  double activeOutstandingGe2ThroughputGBps = activeOutstandingGe2Ns == 0 ? 0.0 : (double)bytes / (double)activeOutstandingGe2Ns;
   uint64_t buckets[ncclIbMeasureSendSummaryBucketCount];
   for (int i = 0; i < ncclIbMeasureSendSummaryBucketCount; ++i) {
     buckets[i] = ncclIbMeasureSendSummaryThroughputBuckets[i].load(std::memory_order_relaxed);
   }
   INFO(NCCL_NET,
-       "NET/IB: send measure summary count=%llu bytes=%llu total_s=%.6f post_s=%.6f cq_wait_s=%.6f wall_cq_s=%.6f active_outstanding_s=%.6f avg_bytes=%.3f avg_total_us=%.3f avg_post_us=%.3f avg_cq_wait_us=%.3f wall_cq_throughput_GBps=%.3f active_outstanding_throughput_GBps=%.3f",
-       (unsigned long long)count, (unsigned long long)bytes, totalS, postS, cqWaitS, wallCqS, activeOutstandingS, avgBytes, avgTotalUs,
-       avgPostUs, avgCqWaitUs, wallCqThroughputGBps, activeOutstandingThroughputGBps);
+       "NET/IB: send measure summary count=%llu bytes=%llu wall_cq_s=%.6f active_outstanding_ge2_s=%.6f wall_cq_throughput_GBps=%.3f active_outstanding_ge2_throughput_GBps=%.3f",
+       (unsigned long long)count, (unsigned long long)bytes, wallCqS, activeOutstandingGe2S,
+       wallCqThroughputGBps, activeOutstandingGe2ThroughputGBps);
   INFO(NCCL_NET,
        "NET/IB: send measure throughput histogram total_GBps_floor buckets_0_to_25plus=0:%llu,1:%llu,2:%llu,3:%llu,4:%llu,5:%llu,6:%llu,7:%llu,8:%llu,9:%llu,10:%llu,11:%llu,12:%llu,13:%llu,14:%llu,15:%llu,16:%llu,17:%llu,18:%llu,19:%llu,20:%llu,21:%llu,22:%llu,23:%llu,24:%llu,25plus:%llu",
        (unsigned long long)buckets[0], (unsigned long long)buckets[1],
@@ -1570,9 +1557,6 @@ static inline void ncclIbMeasureSendComplete(struct ncclIbRequest* req, const ch
   if (ncclParamIbMeasureSend()) {
     ncclIbMeasureSendSummaryCount.fetch_add(1, std::memory_order_relaxed);
     ncclIbMeasureSendSummaryBytes.fetch_add(bytes, std::memory_order_relaxed);
-    ncclIbMeasureSendSummaryTotalNs.fetch_add(totalNs, std::memory_order_relaxed);
-    ncclIbMeasureSendSummaryPostNs.fetch_add(postNs, std::memory_order_relaxed);
-    ncclIbMeasureSendSummaryCqWaitNs.fetch_add(cqWaitNs, std::memory_order_relaxed);
     ncclIbMeasureSendAtomicMinNonZero(&ncclIbMeasureSendSummaryFirstPostDoneNs, postDoneNs);
     ncclIbMeasureSendAtomicMax(&ncclIbMeasureSendSummaryLastCompleteNs, completeNs);
     double reqThroughputGBps = totalNs == 0 ? 0.0 : (double)bytes / (double)totalNs;
