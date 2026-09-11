@@ -196,12 +196,21 @@ static uint64_t ncclIbMeasureSendLastStateNs = 0;
 static uint64_t ncclIbMeasureSendOutstandingBucketStartNs = 0;
 static uint64_t ncclIbMeasureSendOutstandingBucketUsedNs = 0;
 static uint64_t ncclIbMeasureSendOutstandingBucketWeightedNs = 0;
+static uint64_t ncclIbMeasureSendOutstandingBucketBytes = 0;
 static uint64_t ncclIbMeasureSendOutstandingIntervalCount = 0;
 static uint64_t ncclIbMeasureSendOutstandingZeroIntervalCount = 0;
 static uint64_t ncclIbMeasureSendOutstandingObservedNs = 0;
 static uint64_t ncclIbMeasureSendOutstandingWeightedNs = 0;
+static uint64_t ncclIbMeasureSendOutstandingIntervalBytes = 0;
+static uint64_t ncclIbMeasureSendOutstandingActiveGe1Ns = 0;
+static uint64_t ncclIbMeasureSendOutstandingActiveGe2Ns = 0;
+static uint64_t ncclIbMeasureSendOutstandingActiveGe1Bytes = 0;
+static uint64_t ncclIbMeasureSendOutstandingActiveGe2Bytes = 0;
+static uint64_t ncclIbMeasureSendOutstandingActiveGe1BucketCount = 0;
+static uint64_t ncclIbMeasureSendOutstandingActiveGe2BucketCount = 0;
 static double ncclIbMeasureSendOutstandingBucketAvgSum = 0.0;
 static double ncclIbMeasureSendOutstandingMaxBucketAvg = 0.0;
+static double ncclIbMeasureSendOutstandingMaxBucketThroughputGBps = 0.0;
 static nvtxRangeId_t ncclIbMeasureSendIdleNvtxRange = 0;
 
 static inline uint64_t ncclIbMeasureSendNowNs() {
@@ -353,14 +362,42 @@ static inline void ncclIbMeasureSendOutstandingCommitBucketLocked() {
   if (ncclIbMeasureSendOutstandingBucketUsedNs == 0) return;
   double avg = (double)ncclIbMeasureSendOutstandingBucketWeightedNs /
       (double)ncclIbMeasureSendOutstandingBucketUsedNs;
+  double throughputGBps = (double)ncclIbMeasureSendOutstandingBucketBytes /
+      (double)ncclIbMeasureSendOutstandingBucketUsedNs;
   ncclIbMeasureSendOutstandingIntervalCount++;
   ncclIbMeasureSendOutstandingObservedNs += ncclIbMeasureSendOutstandingBucketUsedNs;
   ncclIbMeasureSendOutstandingWeightedNs += ncclIbMeasureSendOutstandingBucketWeightedNs;
+  ncclIbMeasureSendOutstandingIntervalBytes += ncclIbMeasureSendOutstandingBucketBytes;
   ncclIbMeasureSendOutstandingBucketAvgSum += avg;
   if (avg == 0.0) ncclIbMeasureSendOutstandingZeroIntervalCount++;
   if (avg > ncclIbMeasureSendOutstandingMaxBucketAvg) ncclIbMeasureSendOutstandingMaxBucketAvg = avg;
+  if (throughputGBps > ncclIbMeasureSendOutstandingMaxBucketThroughputGBps) {
+    ncclIbMeasureSendOutstandingMaxBucketThroughputGBps = throughputGBps;
+  }
+  if (avg >= 1.0) {
+    ncclIbMeasureSendOutstandingActiveGe1Ns += ncclIbMeasureSendOutstandingBucketUsedNs;
+    ncclIbMeasureSendOutstandingActiveGe1Bytes += ncclIbMeasureSendOutstandingBucketBytes;
+    ncclIbMeasureSendOutstandingActiveGe1BucketCount++;
+  }
+  if (avg >= 2.0) {
+    ncclIbMeasureSendOutstandingActiveGe2Ns += ncclIbMeasureSendOutstandingBucketUsedNs;
+    ncclIbMeasureSendOutstandingActiveGe2Bytes += ncclIbMeasureSendOutstandingBucketBytes;
+    ncclIbMeasureSendOutstandingActiveGe2BucketCount++;
+  }
   ncclIbMeasureSendOutstandingBucketUsedNs = 0;
   ncclIbMeasureSendOutstandingBucketWeightedNs = 0;
+  ncclIbMeasureSendOutstandingBucketBytes = 0;
+}
+
+static inline void ncclIbMeasureSendOutstandingAddCompletedBytesLocked(uint64_t eventNs, uint64_t bytes) {
+  uint64_t intervalNs = ncclIbMeasureSendOutstandingIntervalNs();
+  if (intervalNs == 0 || bytes == 0) return;
+  if (ncclIbMeasureSendOutstandingBucketStartNs == 0) ncclIbMeasureSendOutstandingBucketStartNs = eventNs;
+  while (eventNs >= ncclIbMeasureSendOutstandingBucketStartNs + intervalNs) {
+    ncclIbMeasureSendOutstandingCommitBucketLocked();
+    ncclIbMeasureSendOutstandingBucketStartNs += intervalNs;
+  }
+  ncclIbMeasureSendOutstandingBucketBytes += bytes;
 }
 
 static inline void ncclIbMeasureSendOutstandingAccountLocked(uint64_t startNs, uint64_t endNs, uint64_t outstanding) {
@@ -469,11 +506,25 @@ static void ncclIbMeasureSendOutstandingIntervalSummary() {
   double avgBucketOutstanding = count == 0 ? 0.0 : ncclIbMeasureSendOutstandingBucketAvgSum / (double)count;
   double zeroPct = count == 0 ? 0.0 : 100.0 *
       (double)ncclIbMeasureSendOutstandingZeroIntervalCount / (double)count;
+  double allThroughputGBps = ncclIbMeasureSendOutstandingObservedNs == 0 ? 0.0 :
+      (double)ncclIbMeasureSendOutstandingIntervalBytes / (double)ncclIbMeasureSendOutstandingObservedNs;
+  double activeGe1S = (double)ncclIbMeasureSendOutstandingActiveGe1Ns / 1000000000.0;
+  double activeGe2S = (double)ncclIbMeasureSendOutstandingActiveGe2Ns / 1000000000.0;
+  double activeGe1ThroughputGBps = ncclIbMeasureSendOutstandingActiveGe1Ns == 0 ? 0.0 :
+      (double)ncclIbMeasureSendOutstandingActiveGe1Bytes / (double)ncclIbMeasureSendOutstandingActiveGe1Ns;
+  double activeGe2ThroughputGBps = ncclIbMeasureSendOutstandingActiveGe2Ns == 0 ? 0.0 :
+      (double)ncclIbMeasureSendOutstandingActiveGe2Bytes / (double)ncclIbMeasureSendOutstandingActiveGe2Ns;
   INFO(NCCL_NET,
-       "NET/IB: send measure outstanding interval summary interval_us=%llu intervals=%llu observed_s=%.6f avg_outstanding=%.3f avg_bucket_outstanding=%.3f max_bucket_avg_outstanding=%.3f zero_intervals=%llu zero_interval_pct=%.2f",
+       "NET/IB: send measure outstanding interval summary interval_us=%llu intervals=%llu observed_s=%.6f avg_outstanding=%.3f avg_bucket_outstanding=%.3f max_bucket_avg_outstanding=%.3f zero_intervals=%llu zero_interval_pct=%.2f completed_bytes=%llu all_bucket_throughput_GBps=%.3f max_bucket_throughput_GBps=%.3f active_ge1_buckets=%llu active_ge1_s=%.6f active_ge1_bytes=%llu active_ge1_throughput_GBps=%.3f active_ge2_buckets=%llu active_ge2_s=%.6f active_ge2_bytes=%llu active_ge2_throughput_GBps=%.3f",
        (unsigned long long)intervalUs, (unsigned long long)count, observedS, avgOutstanding,
        avgBucketOutstanding, ncclIbMeasureSendOutstandingMaxBucketAvg,
-       (unsigned long long)ncclIbMeasureSendOutstandingZeroIntervalCount, zeroPct);
+       (unsigned long long)ncclIbMeasureSendOutstandingZeroIntervalCount, zeroPct,
+       (unsigned long long)ncclIbMeasureSendOutstandingIntervalBytes, allThroughputGBps,
+       ncclIbMeasureSendOutstandingMaxBucketThroughputGBps,
+       (unsigned long long)ncclIbMeasureSendOutstandingActiveGe1BucketCount, activeGe1S,
+       (unsigned long long)ncclIbMeasureSendOutstandingActiveGe1Bytes, activeGe1ThroughputGBps,
+       (unsigned long long)ncclIbMeasureSendOutstandingActiveGe2BucketCount, activeGe2S,
+       (unsigned long long)ncclIbMeasureSendOutstandingActiveGe2Bytes, activeGe2ThroughputGBps);
 }
 
 static void ncclIbMeasureSendSummary() __attribute__((destructor));
@@ -1518,9 +1569,10 @@ static inline void ncclIbMeasureSendIdleNvtxEnd() {
   }
 }
 
-static inline uint64_t ncclIbMeasureSendIdleEvent(const char* path, uint64_t eventNs, int delta) {
+static inline uint64_t ncclIbMeasureSendIdleEvent(const char* path, uint64_t eventNs, int delta, uint64_t completedBytes = 0) {
   std::lock_guard<std::mutex> lock(ncclIbMeasureSendIdleMutex);
   ncclIbMeasureSendAccountStateLocked(eventNs);
+  ncclIbMeasureSendOutstandingAddCompletedBytesLocked(eventNs, completedBytes);
   if (delta > 0) {
     if (ncclIbMeasureSendIdleOutstanding == 0 && ncclIbMeasureSendIdleStartNs != 0) {
       if (eventNs < ncclIbMeasureSendIdleStartNs) eventNs = ncclIbMeasureSendIdleStartNs;
@@ -1566,7 +1618,7 @@ static inline void ncclIbMeasureSendComplete(struct ncclIbRequest* req, const ch
   req->measurePostDoneNs = 0;
   if (!ncclIbMeasureSendIsTrackedBytes(bytes)) return;
 
-  uint64_t activeOutstandingGe2EndNs = ncclIbMeasureSendIdleEvent(path, completeNs, -1);
+  uint64_t activeOutstandingGe2EndNs = ncclIbMeasureSendIdleEvent(path, completeNs, -1, bytes);
 
   if (ncclParamIbMeasureSend()) {
     ncclIbMeasureSendSummaryCount.fetch_add(1, std::memory_order_relaxed);
