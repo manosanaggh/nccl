@@ -185,7 +185,9 @@ static uint64_t ncclIbMeasureSendIdleStartNs = 0;
 static const char* ncclIbMeasureSendIdlePath = NULL;
 static uint64_t ncclIbMeasureSendIdleCount = 0;
 static uint64_t ncclIbMeasureSendIdleTotalNs = 0;
+static uint64_t ncclIbMeasureSendActiveOutstandingGe1Ns = 0;
 static uint64_t ncclIbMeasureSendActiveOutstandingGe2Ns = 0;
+static std::atomic<uint64_t> ncclIbMeasureSendActiveOutstandingGe1EstimatedBytes{0};
 static std::atomic<uint64_t> ncclIbMeasureSendActiveOutstandingGe2EstimatedBytes{0};
 static uint64_t ncclIbMeasureSendIdleInsideKernelNs = 0;
 static uint64_t ncclIbMeasureSendIdleOutsideKernelNs = 0;
@@ -400,6 +402,9 @@ static inline void ncclIbMeasureSendAccountStateLocked(uint64_t eventNs, bool ac
       ncclIbMeasureSendOutstandingAccountLocked(ncclIbMeasureSendLastStateNs, eventNs, ncclIbMeasureSendIdleOutstanding);
     }
     bool idle = ncclIbMeasureSendIdleOutstanding == 0 && ncclIbMeasureSendIdleStartNs != 0;
+    if (ncclIbMeasureSendIdleOutstanding >= 1) {
+      ncclIbMeasureSendActiveOutstandingGe1Ns += dt;
+    }
     if (ncclIbMeasureSendIdleOutstanding >= 2) {
       ncclIbMeasureSendActiveOutstandingGe2Ns += dt;
     }
@@ -479,12 +484,16 @@ static void ncclIbMeasureSendOutstandingIntervalSummary() {
 static void ncclIbMeasureSendSummary() __attribute__((destructor));
 static void ncclIbMeasureSendSummary() {
   if (!ncclParamIbMeasureSend()) return;
+  uint64_t activeOutstandingGe1Ns = 0;
   uint64_t activeOutstandingGe2Ns = 0;
   {
     std::lock_guard<std::mutex> lock(ncclIbMeasureSendIdleMutex);
     ncclIbMeasureSendAccountStateLocked(ncclIbMeasureSendNowNs());
+    activeOutstandingGe1Ns = ncclIbMeasureSendActiveOutstandingGe1Ns;
     activeOutstandingGe2Ns = ncclIbMeasureSendActiveOutstandingGe2Ns;
   }
+  uint64_t activeOutstandingGe1EstimatedBytes =
+      ncclIbMeasureSendActiveOutstandingGe1EstimatedBytes.load(std::memory_order_relaxed);
   uint64_t activeOutstandingGe2EstimatedBytes =
       ncclIbMeasureSendActiveOutstandingGe2EstimatedBytes.load(std::memory_order_relaxed);
   uint64_t count = ncclIbMeasureSendSummaryCount.load(std::memory_order_relaxed);
@@ -493,8 +502,11 @@ static void ncclIbMeasureSendSummary() {
   uint64_t lastCompleteNs = ncclIbMeasureSendSummaryLastCompleteNs.load(std::memory_order_relaxed);
   uint64_t wallCqNs = firstPostDoneNs == 0 || lastCompleteNs <= firstPostDoneNs ? 0 : lastCompleteNs - firstPostDoneNs;
   double wallCqS = (double)wallCqNs / 1000000000.0;
+  double activeOutstandingGe1S = (double)activeOutstandingGe1Ns / 1000000000.0;
   double activeOutstandingGe2S = (double)activeOutstandingGe2Ns / 1000000000.0;
   double wallCqThroughputGBps = wallCqNs == 0 ? 0.0 : (double)bytes / (double)wallCqNs;
+  double activeOutstandingGe1ThroughputGBps = activeOutstandingGe1Ns == 0 ? 0.0 :
+      (double)activeOutstandingGe1EstimatedBytes / (double)activeOutstandingGe1Ns;
   double activeOutstandingGe2ThroughputGBps = activeOutstandingGe2Ns == 0 ? 0.0 :
       (double)activeOutstandingGe2EstimatedBytes / (double)activeOutstandingGe2Ns;
   uint64_t buckets[ncclIbMeasureSendSummaryBucketCount];
@@ -502,9 +514,11 @@ static void ncclIbMeasureSendSummary() {
     buckets[i] = ncclIbMeasureSendSummaryThroughputBuckets[i].load(std::memory_order_relaxed);
   }
   INFO(NCCL_NET,
-       "NET/IB: send measure summary count=%llu bytes=%llu wall_cq_s=%.6f active_outstanding_ge2_s=%.6f active_outstanding_ge2_est_bytes=%llu wall_cq_throughput_GBps=%.3f active_outstanding_ge2_est_throughput_GBps=%.3f",
-       (unsigned long long)count, (unsigned long long)bytes, wallCqS, activeOutstandingGe2S,
-       (unsigned long long)activeOutstandingGe2EstimatedBytes, wallCqThroughputGBps,
+       "NET/IB: send measure summary count=%llu bytes=%llu wall_cq_s=%.6f active_outstanding_ge1_s=%.6f active_outstanding_ge1_est_bytes=%llu active_outstanding_ge2_s=%.6f active_outstanding_ge2_est_bytes=%llu wall_cq_throughput_GBps=%.3f active_outstanding_ge1_est_throughput_GBps=%.3f active_outstanding_ge2_est_throughput_GBps=%.3f",
+       (unsigned long long)count, (unsigned long long)bytes, wallCqS,
+       activeOutstandingGe1S, (unsigned long long)activeOutstandingGe1EstimatedBytes,
+       activeOutstandingGe2S, (unsigned long long)activeOutstandingGe2EstimatedBytes,
+       wallCqThroughputGBps, activeOutstandingGe1ThroughputGBps,
        activeOutstandingGe2ThroughputGBps);
   INFO(NCCL_NET,
        "NET/IB: send measure throughput histogram total_GBps_floor buckets_0_to_25plus=0:%llu,1:%llu,2:%llu,3:%llu,4:%llu,5:%llu,6:%llu,7:%llu,8:%llu,9:%llu,10:%llu,11:%llu,12:%llu,13:%llu,14:%llu,15:%llu,16:%llu,17:%llu,18:%llu,19:%llu,20:%llu,21:%llu,22:%llu,23:%llu,24:%llu,25plus:%llu",
@@ -1462,6 +1476,7 @@ struct ncclIbRequest {
   uint64_t measureStartNs;
   uint64_t measurePostDoneNs;
   uint64_t measureBytes;
+  uint64_t measureActiveOutstandingGe1StartNs;
   uint64_t measureActiveOutstandingGe2StartNs;
   union {
     struct {
@@ -1484,12 +1499,14 @@ static inline void ncclIbMeasureSendStart(struct ncclIbRequest* req, uint64_t by
     req->measureStartNs = 0;
     req->measurePostDoneNs = 0;
     req->measureBytes = 0;
+    req->measureActiveOutstandingGe1StartNs = 0;
     req->measureActiveOutstandingGe2StartNs = 0;
     return;
   }
   req->measureStartNs = ncclIbMeasureSendNowNs();
   req->measurePostDoneNs = 0;
   req->measureBytes = bytes;
+  req->measureActiveOutstandingGe1StartNs = 0;
   req->measureActiveOutstandingGe2StartNs = 0;
 }
 
@@ -1518,7 +1535,7 @@ static inline void ncclIbMeasureSendIdleNvtxEnd() {
   }
 }
 
-static inline uint64_t ncclIbMeasureSendIdleEvent(const char* path, uint64_t eventNs, int delta) {
+static inline uint64_t ncclIbMeasureSendIdleEvent(const char* path, uint64_t eventNs, int delta, uint64_t* activeOutstandingGe1Ns = NULL) {
   std::lock_guard<std::mutex> lock(ncclIbMeasureSendIdleMutex);
   ncclIbMeasureSendAccountStateLocked(eventNs);
   if (delta > 0) {
@@ -1541,6 +1558,7 @@ static inline uint64_t ncclIbMeasureSendIdleEvent(const char* path, uint64_t eve
       if (ncclIbMeasureSendIdleNvtxRange == 0) ncclIbMeasureSendIdleNvtxRange = ncclIbMeasureSendIdleNvtxStart();
     }
   }
+  if (activeOutstandingGe1Ns != NULL) *activeOutstandingGe1Ns = ncclIbMeasureSendActiveOutstandingGe1Ns;
   return ncclIbMeasureSendActiveOutstandingGe2Ns;
 }
 
@@ -1548,7 +1566,9 @@ static inline void ncclIbMeasureSendPostDone(struct ncclIbRequest* req, uint64_t
   if (!ncclIbMeasureSendTrackingEnabled() || req->measureStartNs == 0) return;
   req->measurePostDoneNs = postDoneNs;
   if (!ncclIbMeasureSendIsTrackedBytes(req->measureBytes)) return;
-  req->measureActiveOutstandingGe2StartNs = ncclIbMeasureSendIdleEvent(NULL, postDoneNs, 1);
+  uint64_t activeOutstandingGe1StartNs = 0;
+  req->measureActiveOutstandingGe2StartNs = ncclIbMeasureSendIdleEvent(NULL, postDoneNs, 1, &activeOutstandingGe1StartNs);
+  req->measureActiveOutstandingGe1StartNs = activeOutstandingGe1StartNs;
 }
 
 static inline int ncclIbRequestDone(struct ncclIbRequest* req) {
@@ -1566,18 +1586,26 @@ static inline void ncclIbMeasureSendComplete(struct ncclIbRequest* req, const ch
   req->measurePostDoneNs = 0;
   if (!ncclIbMeasureSendIsTrackedBytes(bytes)) return;
 
-  uint64_t activeOutstandingGe2EndNs = ncclIbMeasureSendIdleEvent(path, completeNs, -1);
+  uint64_t activeOutstandingGe1EndNs = 0;
+  uint64_t activeOutstandingGe2EndNs = ncclIbMeasureSendIdleEvent(path, completeNs, -1, &activeOutstandingGe1EndNs);
 
   if (ncclParamIbMeasureSend()) {
     ncclIbMeasureSendSummaryCount.fetch_add(1, std::memory_order_relaxed);
     ncclIbMeasureSendSummaryBytes.fetch_add(bytes, std::memory_order_relaxed);
-    if (postDoneNs != 0 && completeNs > postDoneNs &&
-        activeOutstandingGe2EndNs > req->measureActiveOutstandingGe2StartNs) {
-      uint64_t activeOverlapNs = activeOutstandingGe2EndNs - req->measureActiveOutstandingGe2StartNs;
+    if (postDoneNs != 0 && completeNs > postDoneNs) {
       uint64_t lifetimeNs = completeNs - postDoneNs;
-      if (activeOverlapNs > lifetimeNs) activeOverlapNs = lifetimeNs;
-      uint64_t activeBytes = (uint64_t)((long double)bytes * (long double)activeOverlapNs / (long double)lifetimeNs);
-      ncclIbMeasureSendActiveOutstandingGe2EstimatedBytes.fetch_add(activeBytes, std::memory_order_relaxed);
+      if (activeOutstandingGe1EndNs > req->measureActiveOutstandingGe1StartNs) {
+        uint64_t activeOverlapNs = activeOutstandingGe1EndNs - req->measureActiveOutstandingGe1StartNs;
+        if (activeOverlapNs > lifetimeNs) activeOverlapNs = lifetimeNs;
+        uint64_t activeBytes = (uint64_t)((long double)bytes * (long double)activeOverlapNs / (long double)lifetimeNs);
+        ncclIbMeasureSendActiveOutstandingGe1EstimatedBytes.fetch_add(activeBytes, std::memory_order_relaxed);
+      }
+      if (activeOutstandingGe2EndNs > req->measureActiveOutstandingGe2StartNs) {
+        uint64_t activeOverlapNs = activeOutstandingGe2EndNs - req->measureActiveOutstandingGe2StartNs;
+        if (activeOverlapNs > lifetimeNs) activeOverlapNs = lifetimeNs;
+        uint64_t activeBytes = (uint64_t)((long double)bytes * (long double)activeOverlapNs / (long double)lifetimeNs);
+        ncclIbMeasureSendActiveOutstandingGe2EstimatedBytes.fetch_add(activeBytes, std::memory_order_relaxed);
+      }
     }
     ncclIbMeasureSendAtomicMinNonZero(&ncclIbMeasureSendSummaryFirstPostDoneNs, postDoneNs);
     ncclIbMeasureSendAtomicMax(&ncclIbMeasureSendSummaryLastCompleteNs, completeNs);
@@ -2702,6 +2730,7 @@ ncclResult_t ncclIbMultiSend(struct ncclIbSendComm* comm, int slot) {
           reqs[r]->measureStartNs = measurePostStartNs;
           reqs[r]->measurePostDoneNs = 0;
           reqs[r]->measureBytes = reqs[r]->send.size;
+          reqs[r]->measureActiveOutstandingGe1StartNs = 0;
           reqs[r]->measureActiveOutstandingGe2StartNs = 0;
         }
       }
@@ -2778,6 +2807,7 @@ ncclResult_t ncclIbIsend(void* sendComm, void* data, size_t size, int tag, void*
     req->measureStartNs = 0;
     req->measurePostDoneNs = 0;
     req->measureBytes = 0;
+    req->measureActiveOutstandingGe1StartNs = 0;
     req->measureActiveOutstandingGe2StartNs = 0;
     req->send.offset = 0;
 #ifdef NCCL_ENABLE_NET_PROFILING
@@ -2817,6 +2847,7 @@ ncclResult_t ncclIbIsend(void* sendComm, void* data, size_t size, int tag, void*
           reqs[i]->measureStartNs = 0;
           reqs[i]->measurePostDoneNs = 0;
           reqs[i]->measureBytes = reqs[i]->send.size;
+          reqs[i]->measureActiveOutstandingGe1StartNs = 0;
           reqs[i]->measureActiveOutstandingGe2StartNs = 0;
         }
       }
@@ -3608,6 +3639,7 @@ ncclResult_t ncclGinIbProxyIPut(void *collComm, uint64_t srcOff, void *srcMhandl
   req->measureStartNs = 0;
   req->measurePostDoneNs = 0;
   req->measureBytes = 0;
+  req->measureActiveOutstandingGe1StartNs = 0;
   req->measureActiveOutstandingGe2StartNs = 0;
   for (int i = 0; i < comm->base.vProps.ndevs; i++) {
     req->devBases[i] = &comm->devs[i].base;
@@ -3671,6 +3703,7 @@ ncclResult_t ncclGinIbProxyIPutSignal(void *collComm, uint64_t srcOff, void *src
   req->measureStartNs = 0;
   req->measurePostDoneNs = 0;
   req->measureBytes = 0;
+  req->measureActiveOutstandingGe1StartNs = 0;
   req->measureActiveOutstandingGe2StartNs = 0;
   for (int i = 0; i < comm->base.vProps.ndevs; i++) {
     req->devBases[i] = &comm->devs[i].base;
