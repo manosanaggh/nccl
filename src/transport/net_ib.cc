@@ -153,6 +153,8 @@ NCCL_PARAM(IbDataDirect,"IB_DATA_DIRECT",1);
 
 static std::atomic<uint64_t> ncclIbMeasureSendSummaryCount{0};
 static std::atomic<uint64_t> ncclIbMeasureSendSummaryBytes{0};
+static std::atomic<uint64_t> ncclIbMeasureSendAvgPerSendCount{0};
+static std::atomic<uint64_t> ncclIbMeasureSendAvgPerSendThroughputMilliGBps{0};
 static std::atomic<uint64_t> ncclIbMeasureSendSummaryFirstPostDoneNs{0};
 static std::atomic<uint64_t> ncclIbMeasureSendSummaryLastCompleteNs{0};
 static constexpr int ncclIbMeasureSendSummaryBucketCount = 26;
@@ -179,8 +181,10 @@ bool ncclMeasureIterationAllowed() {
   if (end >= 0 && iteration > end) return false;
   return true;
 }
+struct ncclIbRequest;
 static std::mutex ncclIbMeasureSendIdleMutex;
 static uint64_t ncclIbMeasureSendIdleOutstanding = 0;
+static struct ncclIbRequest* ncclIbMeasureSendSoleOutstandingReq = NULL;
 static uint64_t ncclIbMeasureSendIdleStartNs = 0;
 static const char* ncclIbMeasureSendIdlePath = NULL;
 static uint64_t ncclIbMeasureSendIdleCount = 0;
@@ -486,12 +490,16 @@ static void ncclIbMeasureSendSummary() {
   }
   uint64_t count = ncclIbMeasureSendSummaryCount.load(std::memory_order_relaxed);
   uint64_t bytes = ncclIbMeasureSendSummaryBytes.load(std::memory_order_relaxed);
+  uint64_t avgPerSendCount = ncclIbMeasureSendAvgPerSendCount.load(std::memory_order_relaxed);
+  uint64_t avgPerSendThroughputMilliGBps = ncclIbMeasureSendAvgPerSendThroughputMilliGBps.load(std::memory_order_relaxed);
   uint64_t firstPostDoneNs = ncclIbMeasureSendSummaryFirstPostDoneNs.load(std::memory_order_relaxed);
   uint64_t lastCompleteNs = ncclIbMeasureSendSummaryLastCompleteNs.load(std::memory_order_relaxed);
   uint64_t wallCqNs = firstPostDoneNs == 0 || lastCompleteNs <= firstPostDoneNs ? 0 : lastCompleteNs - firstPostDoneNs;
   double wallCqS = (double)wallCqNs / 1000000000.0;
   double activeOutstandingGe1S = (double)activeOutstandingGe1Ns / 1000000000.0;
   double wallCqThroughputGBps = wallCqNs == 0 ? 0.0 : (double)bytes / (double)wallCqNs;
+  double avgPerSendThroughputGBps = avgPerSendCount == 0 ? 0.0 :
+      (double)avgPerSendThroughputMilliGBps / 1000.0 / (double)avgPerSendCount;
   uint64_t activeOutstandingGe1Bytes = bytes;
   double activeOutstandingGe1ThroughputGBps = activeOutstandingGe1Ns == 0 ? 0.0 :
       (double)activeOutstandingGe1Bytes / (double)activeOutstandingGe1Ns;
@@ -500,10 +508,11 @@ static void ncclIbMeasureSendSummary() {
     buckets[i] = ncclIbMeasureSendSummaryThroughputBuckets[i].load(std::memory_order_relaxed);
   }
   INFO(NCCL_NET,
-       "NET/IB: send measure summary count=%llu bytes=%llu wall_cq_s=%.6f active_outstanding_ge1_s=%.6f active_outstanding_ge1_bytes=%llu wall_cq_throughput_GBps=%.3f active_outstanding_ge1_throughput_GBps=%.3f",
+       "NET/IB: send measure summary count=%llu bytes=%llu wall_cq_s=%.6f active_outstanding_ge1_s=%.6f active_outstanding_ge1_bytes=%llu wall_cq_throughput_GBps=%.3f active_outstanding_ge1_throughput_GBps=%.3f avg_per_send_count=%llu avg_per_send_throughput_GBps=%.3f",
        (unsigned long long)count, (unsigned long long)bytes, wallCqS,
        activeOutstandingGe1S, (unsigned long long)activeOutstandingGe1Bytes,
-       wallCqThroughputGBps, activeOutstandingGe1ThroughputGBps);
+       wallCqThroughputGBps, activeOutstandingGe1ThroughputGBps,
+       (unsigned long long)avgPerSendCount, avgPerSendThroughputGBps);
   INFO(NCCL_NET,
        "NET/IB: send measure throughput histogram total_GBps_floor buckets_0_to_25plus=0:%llu,1:%llu,2:%llu,3:%llu,4:%llu,5:%llu,6:%llu,7:%llu,8:%llu,9:%llu,10:%llu,11:%llu,12:%llu,13:%llu,14:%llu,15:%llu,16:%llu,17:%llu,18:%llu,19:%llu,20:%llu,21:%llu,22:%llu,23:%llu,24:%llu,25plus:%llu",
        (unsigned long long)buckets[0], (unsigned long long)buckets[1],
@@ -1460,6 +1469,7 @@ struct ncclIbRequest {
   uint64_t measureStartNs;
   uint64_t measurePostDoneNs;
   uint64_t measureBytes;
+  int measureIsolated;
   union {
     struct {
       int size;
@@ -1481,11 +1491,13 @@ static inline void ncclIbMeasureSendStart(struct ncclIbRequest* req, uint64_t by
     req->measureStartNs = 0;
     req->measurePostDoneNs = 0;
     req->measureBytes = 0;
+    req->measureIsolated = 0;
     return;
   }
   req->measureStartNs = ncclIbMeasureSendNowNs();
   req->measurePostDoneNs = 0;
   req->measureBytes = bytes;
+  req->measureIsolated = 0;
 }
 
 static inline bool ncclIbMeasureSendIsTrackedBytes(uint64_t bytes) {
@@ -1513,10 +1525,11 @@ static inline void ncclIbMeasureSendIdleNvtxEnd() {
   }
 }
 
-static inline void ncclIbMeasureSendIdleEvent(const char* path, uint64_t eventNs, int delta) {
+static inline void ncclIbMeasureSendIdleEvent(const char* path, uint64_t eventNs, int delta, struct ncclIbRequest* req = NULL) {
   std::lock_guard<std::mutex> lock(ncclIbMeasureSendIdleMutex);
   ncclIbMeasureSendAccountStateLocked(eventNs);
   if (delta > 0) {
+    if (req != NULL) req->measureIsolated = 0;
     if (ncclIbMeasureSendIdleOutstanding == 0 && ncclIbMeasureSendIdleStartNs != 0) {
       if (eventNs < ncclIbMeasureSendIdleStartNs) eventNs = ncclIbMeasureSendIdleStartNs;
       uint64_t idleNs = eventNs - ncclIbMeasureSendIdleStartNs;
@@ -1526,8 +1539,28 @@ static inline void ncclIbMeasureSendIdleEvent(const char* path, uint64_t eventNs
       ncclIbMeasureSendIdleStartNs = 0;
       ncclIbMeasureSendIdlePath = NULL;
     }
+    if (ncclIbMeasureSendIdleOutstanding == 0 && req != NULL) {
+      req->measureIsolated = 1;
+      ncclIbMeasureSendSoleOutstandingReq = req;
+    } else {
+      if (ncclIbMeasureSendSoleOutstandingReq != NULL) {
+        ncclIbMeasureSendSoleOutstandingReq->measureIsolated = 0;
+        ncclIbMeasureSendSoleOutstandingReq = NULL;
+      }
+    }
     ncclIbMeasureSendIdleOutstanding += (uint64_t)delta;
   } else if (delta < 0) {
+    if (req != NULL && req->measureIsolated && ncclIbMeasureSendSoleOutstandingReq == req &&
+        ncclIbMeasureSendIdleOutstanding == 1 && req->measurePostDoneNs != 0 && eventNs > req->measurePostDoneNs) {
+      uint64_t cqNs = eventNs - req->measurePostDoneNs;
+      double reqThroughputGBps = cqNs == 0 ? 0.0 : (double)req->measureBytes / (double)cqNs;
+      ncclIbMeasureSendAvgPerSendCount.fetch_add(1, std::memory_order_relaxed);
+      ncclIbMeasureSendAvgPerSendThroughputMilliGBps.fetch_add((uint64_t)(reqThroughputGBps * 1000.0), std::memory_order_relaxed);
+    }
+    if (req != NULL) req->measureIsolated = 0;
+    if (ncclIbMeasureSendSoleOutstandingReq == req || ncclIbMeasureSendIdleOutstanding <= 1) {
+      ncclIbMeasureSendSoleOutstandingReq = NULL;
+    }
     uint64_t dec = (uint64_t)(-delta);
     ncclIbMeasureSendIdleOutstanding = dec > ncclIbMeasureSendIdleOutstanding ? 0 : ncclIbMeasureSendIdleOutstanding - dec;
     if (ncclIbMeasureSendIdleOutstanding == 0) {
@@ -1542,7 +1575,7 @@ static inline void ncclIbMeasureSendPostDone(struct ncclIbRequest* req, uint64_t
   if (!ncclIbMeasureSendTrackingEnabled() || req->measureStartNs == 0) return;
   req->measurePostDoneNs = postDoneNs;
   if (!ncclIbMeasureSendIsTrackedBytes(req->measureBytes)) return;
-  ncclIbMeasureSendIdleEvent(NULL, postDoneNs, 1);
+  ncclIbMeasureSendIdleEvent(NULL, postDoneNs, 1, req);
 }
 
 static inline int ncclIbRequestDone(struct ncclIbRequest* req) {
@@ -1557,10 +1590,13 @@ static inline void ncclIbMeasureSendComplete(struct ncclIbRequest* req, const ch
   uint64_t postDoneNs = req->measurePostDoneNs;
   uint64_t totalNs = completeNs - startNs;
   req->measureStartNs = 0;
-  req->measurePostDoneNs = 0;
-  if (!ncclIbMeasureSendIsTrackedBytes(bytes)) return;
+  if (!ncclIbMeasureSendIsTrackedBytes(bytes)) {
+    req->measurePostDoneNs = 0;
+    return;
+  }
 
-  ncclIbMeasureSendIdleEvent(path, completeNs, -1);
+  ncclIbMeasureSendIdleEvent(path, completeNs, -1, req);
+  req->measurePostDoneNs = 0;
 
   if (ncclParamIbMeasureSend()) {
     ncclIbMeasureSendSummaryCount.fetch_add(1, std::memory_order_relaxed);
@@ -2688,6 +2724,7 @@ ncclResult_t ncclIbMultiSend(struct ncclIbSendComm* comm, int slot) {
           reqs[r]->measureStartNs = measurePostStartNs;
           reqs[r]->measurePostDoneNs = 0;
           reqs[r]->measureBytes = reqs[r]->send.size;
+          reqs[r]->measureIsolated = 0;
         }
       }
     }
@@ -2763,6 +2800,7 @@ ncclResult_t ncclIbIsend(void* sendComm, void* data, size_t size, int tag, void*
     req->measureStartNs = 0;
     req->measurePostDoneNs = 0;
     req->measureBytes = 0;
+    req->measureIsolated = 0;
     req->send.offset = 0;
 #ifdef NCCL_ENABLE_NET_PROFILING
     req->pInfo[0].pHandle = phandle;
@@ -2801,6 +2839,7 @@ ncclResult_t ncclIbIsend(void* sendComm, void* data, size_t size, int tag, void*
           reqs[i]->measureStartNs = 0;
           reqs[i]->measurePostDoneNs = 0;
           reqs[i]->measureBytes = reqs[i]->send.size;
+          reqs[i]->measureIsolated = 0;
         }
       }
     }
@@ -3591,6 +3630,7 @@ ncclResult_t ncclGinIbProxyIPut(void *collComm, uint64_t srcOff, void *srcMhandl
   req->measureStartNs = 0;
   req->measurePostDoneNs = 0;
   req->measureBytes = 0;
+  req->measureIsolated = 0;
   for (int i = 0; i < comm->base.vProps.ndevs; i++) {
     req->devBases[i] = &comm->devs[i].base;
   }
@@ -3653,6 +3693,7 @@ ncclResult_t ncclGinIbProxyIPutSignal(void *collComm, uint64_t srcOff, void *src
   req->measureStartNs = 0;
   req->measurePostDoneNs = 0;
   req->measureBytes = 0;
+  req->measureIsolated = 0;
   for (int i = 0; i < comm->base.vProps.ndevs; i++) {
     req->devBases[i] = &comm->devs[i].base;
   }
