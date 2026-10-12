@@ -138,6 +138,8 @@ NCCL_PARAM(IbMeasureSendOutstandingIntervalUs, "IB_MEASURE_SEND_OUTSTANDING_INTE
 NCCL_PARAM(IbMeasureSendIdleNvtx, "IB_MEASURE_SEND_IDLE_NVTX", 0);
 NCCL_PARAM(IbMeasureSendKernelOverlap, "IB_MEASURE_SEND_KERNEL_OVERLAP", 0);
 NCCL_PARAM(IbMeasureSendKernelOverlapCallbacks, "IB_MEASURE_SEND_KERNEL_OVERLAP_CALLBACKS", 0);
+NCCL_PARAM(IbSendPostDelayUs, "IB_SEND_POST_DELAY_US", 0);
+NCCL_PARAM(IbSendPostDelayMinBytes, "IB_SEND_POST_DELAY_MIN_BYTES", 0);
 NCCL_PARAM(MeasureIterStart, "MEASURE_ITER_START", -1);
 NCCL_PARAM(MeasureIterEnd, "MEASURE_ITER_END", -1);
 NCCL_PARAM(CodepathTrace, "CODEPATH_TRACE", 0);
@@ -345,6 +347,20 @@ static inline void ncclIbMeasureSendAtomicMax(std::atomic<uint64_t>* value, uint
 static inline bool ncclIbMeasureSendTrackingEnabled() {
   return ncclParamIbMeasureSend() || ncclIbMeasureSendOutstandingIntervalEnabled() ||
       ncclParamIbMeasureSendIdleNvtx() || ncclIbMeasureSendKernelOverlapEnabled();
+}
+
+static inline void ncclIbMaybeDelaySendPost(uint64_t bytes) {
+  int64_t delayUs = ncclParamIbSendPostDelayUs();
+  if (delayUs <= 0) return;
+  int64_t minBytes = ncclParamIbSendPostDelayMinBytes();
+  if (minBytes < 0) minBytes = 0;
+  if (bytes < (uint64_t)minBytes) return;
+
+  while (delayUs > 0) {
+    useconds_t chunkUs = delayUs > 1000000 ? 1000000 : (useconds_t)delayUs;
+    usleep(chunkUs);
+    delayUs -= chunkUs;
+  }
 }
 
 static inline uint64_t ncclIbMeasureSendOutstandingIntervalNs() {
@@ -2664,6 +2680,9 @@ ncclResult_t ncclIbMultiSend(struct ncclIbSendComm* comm, int slot) {
          comm->base.vProps.ndevs, comm->base.ready);
     }
   }
+  uint64_t sendPostDelayBytes = 0;
+  for (int r=0; r<nreqs; r++) sendPostDelayBytes += (uint64_t)reqs[r]->send.size;
+
   for (int i = 0; i < nqps; i++) {
     int qpIndex = comm->base.qpIndex;
     ncclIbQp* qp = comm->base.qps + qpIndex;
@@ -2716,6 +2735,7 @@ ncclResult_t ncclIbMultiSend(struct ncclIbSendComm* comm, int slot) {
       reqs[r]->pInfo[0].nEventHandles++;
     }
 #endif
+    ncclIbMaybeDelaySendPost(sendPostDelayBytes);
     if (measureSend) {
       uint64_t postStartNs = ncclIbMeasureSendNowNs();
       if (measurePostStartNs == 0) {
