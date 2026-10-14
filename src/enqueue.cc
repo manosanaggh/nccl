@@ -23,18 +23,67 @@
 #include <cinttypes> // PRIx64
 #include <cassert>
 #include <atomic>
+#include <dlfcn.h>
+
+#ifndef RTLD_NOLOAD
+#define RTLD_NOLOAD 0
+#endif
 
 NCCL_PARAM(L1SharedMemoryCarveout, "L1_SHARED_MEMORY_CARVEOUT", 0);
+NCCL_PARAM(PortalsMeasurePtlputKernelOverlap, "PORTALS_MEASURE_PTLPUT_KERNEL_OVERLAP", 0);
+NCCL_PARAM(PortalsMeasurePtlputKernelOverlapCallbacks, "PORTALS_MEASURE_PTLPUT_KERNEL_OVERLAP_CALLBACKS", 0);
 extern int64_t ncclParamDeviceMeasureRingPrims();
 
 static std::atomic<uint64_t> ncclRingPrimMeasureOpSlot{0};
 
-static void CUDART_CB ncclIbMeasureKernelActiveEndCallback(void*) {
+typedef void (*ncclPortalsMeasureKernelActiveFn)();
+
+static ncclPortalsMeasureKernelActiveFn ncclPortalsMeasureKernelActiveHook(const char* symbol) {
+  static bool resolved = false;
+  static ncclPortalsMeasureKernelActiveFn startFn = nullptr;
+  static ncclPortalsMeasureKernelActiveFn endFn = nullptr;
+
+  if (!resolved) {
+    void* handle = nullptr;
+    startFn = (ncclPortalsMeasureKernelActiveFn)dlsym(RTLD_DEFAULT, "ptl_rma_measure_kernel_active_start");
+    endFn = (ncclPortalsMeasureKernelActiveFn)dlsym(RTLD_DEFAULT, "ptl_rma_measure_kernel_active_end");
+    if (startFn == nullptr || endFn == nullptr) {
+      handle = dlopen("libfabric.so.1", RTLD_NOW | RTLD_NOLOAD);
+      if (handle == nullptr) handle = dlopen("libfabric.so", RTLD_NOW | RTLD_NOLOAD);
+      if (handle != nullptr) {
+        if (startFn == nullptr) startFn = (ncclPortalsMeasureKernelActiveFn)dlsym(handle, "ptl_rma_measure_kernel_active_start");
+        if (endFn == nullptr) endFn = (ncclPortalsMeasureKernelActiveFn)dlsym(handle, "ptl_rma_measure_kernel_active_end");
+      }
+    }
+    resolved = true;
+  }
+
+  if (strcmp(symbol, "start") == 0) return startFn;
+  return endFn;
+}
+
+static void ncclMeasureKernelActiveStartAll() {
+  ncclIbMeasureKernelActiveStart();
+  if (ncclParamPortalsMeasurePtlputKernelOverlap()) {
+    ncclPortalsMeasureKernelActiveFn fn = ncclPortalsMeasureKernelActiveHook("start");
+    if (fn != nullptr) fn();
+  }
+}
+
+static void ncclMeasureKernelActiveEndAll() {
   ncclIbMeasureKernelActiveEnd();
+  if (ncclParamPortalsMeasurePtlputKernelOverlap()) {
+    ncclPortalsMeasureKernelActiveFn fn = ncclPortalsMeasureKernelActiveHook("end");
+    if (fn != nullptr) fn();
+  }
+}
+
+static void CUDART_CB ncclIbMeasureKernelActiveEndCallback(void*) {
+  ncclMeasureKernelActiveEndAll();
 }
 
 static void CUDART_CB ncclIbMeasureKernelActiveStartCallback(void*) {
-  ncclIbMeasureKernelActiveStart();
+  ncclMeasureKernelActiveStartAll();
 }
 
 // Returns maximum kernel stack size of all CUDA kernels
@@ -1653,8 +1702,8 @@ ncclResult_t ncclLaunchKernel(struct ncclComm* comm, struct ncclKernelPlan* plan
 
   bool hasMeasureAgRsWork = planHasMeasureAgRsWork(plan);
   bool measureIterationAllowed = ncclMeasureIterationAllowed();
-  bool measureKernelOverlap = ncclIbMeasureSendKernelOverlapEnabled() && !ncclCudaGraphValid(planner->capturingGraph) && hasMeasureAgRsWork && measureIterationAllowed;
-  bool measureKernelOverlapCallbacks = measureKernelOverlap && ncclIbMeasureSendKernelOverlapCallbacksEnabled();
+  bool measureKernelOverlap = (ncclIbMeasureSendKernelOverlapEnabled() || ncclParamPortalsMeasurePtlputKernelOverlap()) && !ncclCudaGraphValid(planner->capturingGraph) && hasMeasureAgRsWork && measureIterationAllowed;
+  bool measureKernelOverlapCallbacks = measureKernelOverlap && (ncclIbMeasureSendKernelOverlapCallbacksEnabled() || ncclParamPortalsMeasurePtlputKernelOverlapCallbacks());
   bool measureKernelActiveStarted = false;
   bool measureKernelActiveEndQueued = false;
   bool measureKernelGpuEventsCreated = false;
@@ -1746,7 +1795,7 @@ ncclResult_t ncclLaunchKernel(struct ncclComm* comm, struct ncclKernelPlan* plan
         CUDACHECKGOTO(cudaLaunchHostFunc(launchStream, ncclIbMeasureKernelActiveStartCallback, nullptr), ret, do_return);
         measureKernelActiveStarted = true;
       } else {
-        ncclIbMeasureKernelActiveStart();
+        ncclMeasureKernelActiveStartAll();
         measureKernelActiveStarted = true;
       }
     }
@@ -1763,7 +1812,7 @@ ncclResult_t ncclLaunchKernel(struct ncclComm* comm, struct ncclKernelPlan* plan
         CUDACHECKGOTO(cudaLaunchHostFunc(launchStream, ncclIbMeasureKernelActiveStartCallback, nullptr), ret, do_return);
         measureKernelActiveStarted = true;
       } else {
-        ncclIbMeasureKernelActiveStart();
+        ncclMeasureKernelActiveStartAll();
         measureKernelActiveStarted = true;
       }
     }
@@ -1783,7 +1832,7 @@ ncclResult_t ncclLaunchKernel(struct ncclComm* comm, struct ncclKernelPlan* plan
   }
 
 do_return:
-  if (measureKernelActiveStarted && !measureKernelActiveEndQueued) ncclIbMeasureKernelActiveEnd();
+  if (measureKernelActiveStarted && !measureKernelActiveEndQueued) ncclMeasureKernelActiveEndAll();
   if (measureKernelGpuEventsCreated && !measureKernelGpuEventsRecorded) {
     if (measureKernelStartEvent != NULL) CUDACHECK(cudaEventDestroy(measureKernelStartEvent));
     if (measureKernelEndEvent != NULL) CUDACHECK(cudaEventDestroy(measureKernelEndEvent));
