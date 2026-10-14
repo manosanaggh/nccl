@@ -55,6 +55,8 @@ static std::atomic<uint64_t> ncclPortalsMeasureStartMisses{0};
 static std::atomic<uint64_t> ncclPortalsMeasureEndCalls{0};
 static std::atomic<uint64_t> ncclPortalsMeasureEndHookCalls{0};
 static std::atomic<uint64_t> ncclPortalsMeasureEndMisses{0};
+static std::atomic<uint64_t> ncclPortalsMeasureLaunchSampleLogs{0};
+static std::atomic<uint64_t> ncclPortalsMeasureResolveLogs{0};
 
 struct ncclPortalsMeasureDlIterateState {
   ncclPortalsMeasureKernelActiveFn startFn;
@@ -112,6 +114,14 @@ static ncclPortalsMeasureKernelActiveFn ncclPortalsMeasureKernelActiveHook(const
 
     if (startFn == nullptr || endFn == nullptr) {
       ncclPortalsMeasureResolveFailed.fetch_add(1, std::memory_order_relaxed);
+    }
+    if (ncclPortalsMeasureResolveLogs.fetch_add(1, std::memory_order_relaxed) == 0) {
+      WARN("PORTALS measure NCCL hook resolve start=%p end=%p rtld_default=%llu dlopen=%llu dl_iterate=%llu failed=%llu",
+           (void*)startFn, (void*)endFn,
+           (unsigned long long)ncclPortalsMeasureRtldDefaultResolved.load(std::memory_order_relaxed),
+           (unsigned long long)ncclPortalsMeasureDlopenResolved.load(std::memory_order_relaxed),
+           (unsigned long long)ncclPortalsMeasureIterateResolved.load(std::memory_order_relaxed),
+           (unsigned long long)ncclPortalsMeasureResolveFailed.load(std::memory_order_relaxed));
     }
     resolved = true;
   }
@@ -1805,6 +1815,16 @@ ncclResult_t ncclLaunchKernel(struct ncclComm* comm, struct ncclKernelPlan* plan
   if (portalsMeasureKernelOverlapEnabled && measureKernelOverlap) {
     ncclPortalsMeasureOverlapPlans.fetch_add(1, std::memory_order_relaxed);
     if (measureKernelOverlapCallbacks) ncclPortalsMeasureCallbackPlans.fetch_add(1, std::memory_order_relaxed);
+  }
+  if (portalsMeasureKernelOverlapEnabled) {
+    uint64_t sample = ncclPortalsMeasureLaunchSampleLogs.fetch_add(1, std::memory_order_relaxed);
+    if (sample < 8 || (hasMeasureAgRsWork && measureKernelOverlap && sample < 32)) {
+      WARN("PORTALS measure NCCL launch sample=%llu rank=%d has_ag_rs=%d iter_allowed=%d cuda_graph=%d overlap=%d callbacks=%d collOpCount=%d nWorkBatches=%d channelMask=0x%llx",
+           (unsigned long long)sample, comm->rank, hasMeasureAgRsWork ? 1 : 0,
+           measureIterationAllowed ? 1 : 0, ncclCudaGraphValid(planner->capturingGraph) ? 1 : 0,
+           measureKernelOverlap ? 1 : 0, measureKernelOverlapCallbacks ? 1 : 0,
+           plan->collOpCount, plan->nWorkBatches, (unsigned long long)plan->channelMask);
+    }
   }
   bool measureKernelActiveStarted = false;
   bool measureKernelActiveEndQueued = false;
