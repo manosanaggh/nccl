@@ -24,6 +24,7 @@
 #include <cassert>
 #include <atomic>
 #include <dlfcn.h>
+#include <link.h>
 
 #ifndef RTLD_NOLOAD
 #define RTLD_NOLOAD 0
@@ -38,22 +39,79 @@ static std::atomic<uint64_t> ncclRingPrimMeasureOpSlot{0};
 
 typedef void (*ncclPortalsMeasureKernelActiveFn)();
 
+static std::atomic<uint64_t> ncclPortalsMeasurePlans{0};
+static std::atomic<uint64_t> ncclPortalsMeasureAgRsPlans{0};
+static std::atomic<uint64_t> ncclPortalsMeasureIterationAllowedPlans{0};
+static std::atomic<uint64_t> ncclPortalsMeasureOverlapPlans{0};
+static std::atomic<uint64_t> ncclPortalsMeasureCallbackPlans{0};
+static std::atomic<uint64_t> ncclPortalsMeasureResolveAttempts{0};
+static std::atomic<uint64_t> ncclPortalsMeasureRtldDefaultResolved{0};
+static std::atomic<uint64_t> ncclPortalsMeasureDlopenResolved{0};
+static std::atomic<uint64_t> ncclPortalsMeasureIterateResolved{0};
+static std::atomic<uint64_t> ncclPortalsMeasureResolveFailed{0};
+static std::atomic<uint64_t> ncclPortalsMeasureStartCalls{0};
+static std::atomic<uint64_t> ncclPortalsMeasureStartHookCalls{0};
+static std::atomic<uint64_t> ncclPortalsMeasureStartMisses{0};
+static std::atomic<uint64_t> ncclPortalsMeasureEndCalls{0};
+static std::atomic<uint64_t> ncclPortalsMeasureEndHookCalls{0};
+static std::atomic<uint64_t> ncclPortalsMeasureEndMisses{0};
+
+struct ncclPortalsMeasureDlIterateState {
+  ncclPortalsMeasureKernelActiveFn startFn;
+  ncclPortalsMeasureKernelActiveFn endFn;
+};
+
+static int ncclPortalsMeasureDlIterateCallback(struct dl_phdr_info* info, size_t, void* data) {
+  struct ncclPortalsMeasureDlIterateState* state = (struct ncclPortalsMeasureDlIterateState*)data;
+  if (info == nullptr || info->dlpi_name == nullptr || info->dlpi_name[0] == '\0') return 0;
+  if (strstr(info->dlpi_name, "libfabric.so") == nullptr) return 0;
+
+  void* handle = dlopen(info->dlpi_name, RTLD_NOW | RTLD_NOLOAD);
+  if (handle == nullptr) return 0;
+
+  if (state->startFn == nullptr) state->startFn = (ncclPortalsMeasureKernelActiveFn)dlsym(handle, "ptl_rma_measure_kernel_active_start");
+  if (state->endFn == nullptr) state->endFn = (ncclPortalsMeasureKernelActiveFn)dlsym(handle, "ptl_rma_measure_kernel_active_end");
+  return (state->startFn != nullptr && state->endFn != nullptr) ? 1 : 0;
+}
+
 static ncclPortalsMeasureKernelActiveFn ncclPortalsMeasureKernelActiveHook(const char* symbol) {
   static bool resolved = false;
   static ncclPortalsMeasureKernelActiveFn startFn = nullptr;
   static ncclPortalsMeasureKernelActiveFn endFn = nullptr;
 
   if (!resolved) {
-    void* handle = nullptr;
+    ncclPortalsMeasureResolveAttempts.fetch_add(1, std::memory_order_relaxed);
+
     startFn = (ncclPortalsMeasureKernelActiveFn)dlsym(RTLD_DEFAULT, "ptl_rma_measure_kernel_active_start");
     endFn = (ncclPortalsMeasureKernelActiveFn)dlsym(RTLD_DEFAULT, "ptl_rma_measure_kernel_active_end");
+    if (startFn != nullptr && endFn != nullptr) {
+      ncclPortalsMeasureRtldDefaultResolved.fetch_add(1, std::memory_order_relaxed);
+    }
+
     if (startFn == nullptr || endFn == nullptr) {
-      handle = dlopen("libfabric.so.1", RTLD_NOW | RTLD_NOLOAD);
+      void* handle = dlopen("libfabric.so.1", RTLD_NOW | RTLD_NOLOAD);
       if (handle == nullptr) handle = dlopen("libfabric.so", RTLD_NOW | RTLD_NOLOAD);
       if (handle != nullptr) {
         if (startFn == nullptr) startFn = (ncclPortalsMeasureKernelActiveFn)dlsym(handle, "ptl_rma_measure_kernel_active_start");
         if (endFn == nullptr) endFn = (ncclPortalsMeasureKernelActiveFn)dlsym(handle, "ptl_rma_measure_kernel_active_end");
+        if (startFn != nullptr && endFn != nullptr) {
+          ncclPortalsMeasureDlopenResolved.fetch_add(1, std::memory_order_relaxed);
+        }
       }
+    }
+
+    if (startFn == nullptr || endFn == nullptr) {
+      struct ncclPortalsMeasureDlIterateState state = { startFn, endFn };
+      dl_iterate_phdr(ncclPortalsMeasureDlIterateCallback, &state);
+      startFn = state.startFn;
+      endFn = state.endFn;
+      if (startFn != nullptr && endFn != nullptr) {
+        ncclPortalsMeasureIterateResolved.fetch_add(1, std::memory_order_relaxed);
+      }
+    }
+
+    if (startFn == nullptr || endFn == nullptr) {
+      ncclPortalsMeasureResolveFailed.fetch_add(1, std::memory_order_relaxed);
     }
     resolved = true;
   }
@@ -62,19 +120,53 @@ static ncclPortalsMeasureKernelActiveFn ncclPortalsMeasureKernelActiveHook(const
   return endFn;
 }
 
+static void ncclPortalsMeasureSummary() __attribute__((destructor));
+static void ncclPortalsMeasureSummary() {
+  if (!ncclParamPortalsMeasurePtlputKernelOverlap()) return;
+  WARN("PORTALS measure NCCL summary plans=%llu ag_rs_plans=%llu iter_allowed_plans=%llu overlap_plans=%llu callback_plans=%llu resolve_attempts=%llu rtld_default_resolved=%llu dlopen_resolved=%llu dl_iterate_resolved=%llu resolve_failed=%llu start_calls=%llu start_hook_calls=%llu start_misses=%llu end_calls=%llu end_hook_calls=%llu end_misses=%llu",
+       (unsigned long long)ncclPortalsMeasurePlans.load(std::memory_order_relaxed),
+       (unsigned long long)ncclPortalsMeasureAgRsPlans.load(std::memory_order_relaxed),
+       (unsigned long long)ncclPortalsMeasureIterationAllowedPlans.load(std::memory_order_relaxed),
+       (unsigned long long)ncclPortalsMeasureOverlapPlans.load(std::memory_order_relaxed),
+       (unsigned long long)ncclPortalsMeasureCallbackPlans.load(std::memory_order_relaxed),
+       (unsigned long long)ncclPortalsMeasureResolveAttempts.load(std::memory_order_relaxed),
+       (unsigned long long)ncclPortalsMeasureRtldDefaultResolved.load(std::memory_order_relaxed),
+       (unsigned long long)ncclPortalsMeasureDlopenResolved.load(std::memory_order_relaxed),
+       (unsigned long long)ncclPortalsMeasureIterateResolved.load(std::memory_order_relaxed),
+       (unsigned long long)ncclPortalsMeasureResolveFailed.load(std::memory_order_relaxed),
+       (unsigned long long)ncclPortalsMeasureStartCalls.load(std::memory_order_relaxed),
+       (unsigned long long)ncclPortalsMeasureStartHookCalls.load(std::memory_order_relaxed),
+       (unsigned long long)ncclPortalsMeasureStartMisses.load(std::memory_order_relaxed),
+       (unsigned long long)ncclPortalsMeasureEndCalls.load(std::memory_order_relaxed),
+       (unsigned long long)ncclPortalsMeasureEndHookCalls.load(std::memory_order_relaxed),
+       (unsigned long long)ncclPortalsMeasureEndMisses.load(std::memory_order_relaxed));
+}
+
 static void ncclMeasureKernelActiveStartAll() {
   ncclIbMeasureKernelActiveStart();
   if (ncclParamPortalsMeasurePtlputKernelOverlap()) {
+    ncclPortalsMeasureStartCalls.fetch_add(1, std::memory_order_relaxed);
     ncclPortalsMeasureKernelActiveFn fn = ncclPortalsMeasureKernelActiveHook("start");
-    if (fn != nullptr) fn();
+    if (fn != nullptr) {
+      fn();
+      ncclPortalsMeasureStartHookCalls.fetch_add(1, std::memory_order_relaxed);
+    } else {
+      ncclPortalsMeasureStartMisses.fetch_add(1, std::memory_order_relaxed);
+    }
   }
 }
 
 static void ncclMeasureKernelActiveEndAll() {
   ncclIbMeasureKernelActiveEnd();
   if (ncclParamPortalsMeasurePtlputKernelOverlap()) {
+    ncclPortalsMeasureEndCalls.fetch_add(1, std::memory_order_relaxed);
     ncclPortalsMeasureKernelActiveFn fn = ncclPortalsMeasureKernelActiveHook("end");
-    if (fn != nullptr) fn();
+    if (fn != nullptr) {
+      fn();
+      ncclPortalsMeasureEndHookCalls.fetch_add(1, std::memory_order_relaxed);
+    } else {
+      ncclPortalsMeasureEndMisses.fetch_add(1, std::memory_order_relaxed);
+    }
   }
 }
 
@@ -1702,8 +1794,18 @@ ncclResult_t ncclLaunchKernel(struct ncclComm* comm, struct ncclKernelPlan* plan
 
   bool hasMeasureAgRsWork = planHasMeasureAgRsWork(plan);
   bool measureIterationAllowed = ncclMeasureIterationAllowed();
-  bool measureKernelOverlap = (ncclIbMeasureSendKernelOverlapEnabled() || ncclParamPortalsMeasurePtlputKernelOverlap()) && !ncclCudaGraphValid(planner->capturingGraph) && hasMeasureAgRsWork && measureIterationAllowed;
+  bool portalsMeasureKernelOverlapEnabled = ncclParamPortalsMeasurePtlputKernelOverlap();
+  if (portalsMeasureKernelOverlapEnabled) {
+    ncclPortalsMeasurePlans.fetch_add(1, std::memory_order_relaxed);
+    if (hasMeasureAgRsWork) ncclPortalsMeasureAgRsPlans.fetch_add(1, std::memory_order_relaxed);
+    if (measureIterationAllowed) ncclPortalsMeasureIterationAllowedPlans.fetch_add(1, std::memory_order_relaxed);
+  }
+  bool measureKernelOverlap = (ncclIbMeasureSendKernelOverlapEnabled() || portalsMeasureKernelOverlapEnabled) && !ncclCudaGraphValid(planner->capturingGraph) && hasMeasureAgRsWork && measureIterationAllowed;
   bool measureKernelOverlapCallbacks = measureKernelOverlap && (ncclIbMeasureSendKernelOverlapCallbacksEnabled() || ncclParamPortalsMeasurePtlputKernelOverlapCallbacks());
+  if (portalsMeasureKernelOverlapEnabled && measureKernelOverlap) {
+    ncclPortalsMeasureOverlapPlans.fetch_add(1, std::memory_order_relaxed);
+    if (measureKernelOverlapCallbacks) ncclPortalsMeasureCallbackPlans.fetch_add(1, std::memory_order_relaxed);
+  }
   bool measureKernelActiveStarted = false;
   bool measureKernelActiveEndQueued = false;
   bool measureKernelGpuEventsCreated = false;
