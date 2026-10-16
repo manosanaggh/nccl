@@ -140,6 +140,8 @@ NCCL_PARAM(IbMeasureSendKernelOverlap, "IB_MEASURE_SEND_KERNEL_OVERLAP", 0);
 NCCL_PARAM(IbMeasureSendKernelOverlapCallbacks, "IB_MEASURE_SEND_KERNEL_OVERLAP_CALLBACKS", 0);
 NCCL_PARAM(IbSendPostDelayUs, "IB_SEND_POST_DELAY_US", 0);
 NCCL_PARAM(IbSendPostDelayMinBytes, "IB_SEND_POST_DELAY_MIN_BYTES", 0);
+NCCL_PARAM(IbRecvCompletionDelayUs, "IB_RECV_COMPLETION_DELAY_US", 0);
+NCCL_PARAM(IbRecvCompletionDelayMinBytes, "IB_RECV_COMPLETION_DELAY_MIN_BYTES", 0);
 NCCL_PARAM(MeasureIterStart, "MEASURE_ITER_START", -1);
 NCCL_PARAM(MeasureIterEnd, "MEASURE_ITER_END", -1);
 NCCL_PARAM(CodepathTrace, "CODEPATH_TRACE", 0);
@@ -1486,6 +1488,7 @@ struct ncclIbRequest {
   uint64_t measurePostDoneNs;
   uint64_t measureBytes;
   int measureIsolated;
+  uint64_t recvCompletionObservedNs;
   union {
     struct {
       int size;
@@ -1596,6 +1599,23 @@ static inline void ncclIbMeasureSendPostDone(struct ncclIbRequest* req, uint64_t
 
 static inline int ncclIbRequestDone(struct ncclIbRequest* req) {
   return req->events[0] == 0 && req->events[1] == 0 && req->events[2] == 0 && req->events[3] == 0;
+}
+
+static inline bool ncclIbRecvCompletionVisible(struct ncclIbRequest* req) {
+  if (req->type != NCCL_NET_IB_REQ_RECV) return true;
+  int64_t delayUs = ncclParamIbRecvCompletionDelayUs();
+  if (delayUs <= 0) return true;
+  int64_t minBytes = ncclParamIbRecvCompletionDelayMinBytes();
+  uint64_t bytes = 0;
+  for (int i = 0; i < req->nreqs; i++) bytes += (uint64_t)req->recv.sizes[i];
+  if (minBytes > 0 && bytes < (uint64_t)minBytes) return true;
+
+  uint64_t nowNs = ncclIbMeasureSendNowNs();
+  if (req->recvCompletionObservedNs == 0) req->recvCompletionObservedNs = nowNs;
+  // Compare elapsed time without sleeping or delaying CQ processing for other requests.
+  uint64_t delayNs = (uint64_t)delayUs > UINT64_MAX / 1000
+      ? UINT64_MAX : (uint64_t)delayUs * 1000;
+  return nowNs - req->recvCompletionObservedNs >= delayNs;
 }
 
 static inline void ncclIbMeasureSendComplete(struct ncclIbRequest* req, const char* path) {
@@ -2459,6 +2479,7 @@ ncclResult_t ncclIbGetRequest(struct ncclIbNetCommBase* base, struct ncclIbReque
       r->sock = NULL;
       memset(r->devBases, 0, sizeof(r->devBases));
       memset(r->events, 0, sizeof(r->events));
+      r->recvCompletionObservedNs = 0;
       *req = r;
       return ncclSuccess;
     }
@@ -3081,6 +3102,7 @@ ncclResult_t ncclIbTest(void* request, int* done, int* sizes) {
   while (1) {
     NCCLCHECK(ncclIbStatsCheckFatalCount(&r->base->stats,__func__));
     if (ncclIbRequestDone(r)) {
+      if (!ncclIbRecvCompletionVisible(r)) return ncclSuccess;
       TRACE(NCCL_NET, "r=%p done", r);
       *done = 1;
       if (sizes && r->type == NCCL_NET_IB_REQ_RECV) {
@@ -3182,6 +3204,9 @@ ncclResult_t ncclIbTest(void* request, int* done, int* sizes) {
               }
             }
             req->events[i]--;
+            // Timestamp the final observed CQ completion even when polling for another request.
+            if (req->type == NCCL_NET_IB_REQ_RECV && ncclIbRequestDone(req))
+              (void)ncclIbRecvCompletionVisible(req);
 #ifdef NCCL_ENABLE_NET_PROFILING
             // Stop Qp event for workFifo
             for (int j = 0; j < req->nreqs; j++) {
