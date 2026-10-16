@@ -155,6 +155,7 @@ NCCL_PARAM(IbAsyncEvents,"IB_RETURN_ASYNC_EVENTS",1);
 NCCL_PARAM(IbEceEnable,"IB_ECE_ENABLE",1);
 NCCL_PARAM(IbDataDirect,"IB_DATA_DIRECT",1);
 
+static std::atomic<uint64_t> ncclIbRecvCompletionDelayCount{0};
 static std::atomic<uint64_t> ncclIbMeasureSendSummaryCount{0};
 static std::atomic<uint64_t> ncclIbMeasureSendSummaryBytes{0};
 static std::atomic<uint64_t> ncclIbMeasureSendAvgPerSendCount{0};
@@ -495,6 +496,15 @@ static void ncclIbMeasureSendOutstandingIntervalSummary() {
        (unsigned long long)intervalUs, (unsigned long long)count, observedS, avgOutstanding,
        avgBucketOutstanding, ncclIbMeasureSendOutstandingMaxBucketAvg,
        (unsigned long long)ncclIbMeasureSendOutstandingZeroIntervalCount, zeroPct);
+}
+
+static void ncclIbRecvCompletionDelaySummary() __attribute__((destructor));
+static void ncclIbRecvCompletionDelaySummary() {
+  if (ncclParamIbRecvCompletionDelayUs() <= 0) return;
+  INFO(NCCL_NET, "NET/IB: recv completion delay summary delayed_requests=%llu delay_us=%lld min_bytes=%lld",
+       (unsigned long long)ncclIbRecvCompletionDelayCount.load(std::memory_order_relaxed),
+       (long long)ncclParamIbRecvCompletionDelayUs(),
+       (long long)ncclParamIbRecvCompletionDelayMinBytes());
 }
 
 static void ncclIbMeasureSendSummary() __attribute__((destructor));
@@ -1611,7 +1621,10 @@ static inline bool ncclIbRecvCompletionVisible(struct ncclIbRequest* req) {
   if (minBytes > 0 && bytes < (uint64_t)minBytes) return true;
 
   uint64_t nowNs = ncclIbMeasureSendNowNs();
-  if (req->recvCompletionObservedNs == 0) req->recvCompletionObservedNs = nowNs;
+  if (req->recvCompletionObservedNs == 0) {
+    req->recvCompletionObservedNs = nowNs;
+    ncclIbRecvCompletionDelayCount.fetch_add(1, std::memory_order_relaxed);
+  }
   // Compare elapsed time without sleeping or delaying CQ processing for other requests.
   uint64_t delayNs = (uint64_t)delayUs > UINT64_MAX / 1000
       ? UINT64_MAX : (uint64_t)delayUs * 1000;
