@@ -142,6 +142,8 @@ NCCL_PARAM(IbSendPostDelayUs, "IB_SEND_POST_DELAY_US", 0);
 NCCL_PARAM(IbSendPostDelayMinBytes, "IB_SEND_POST_DELAY_MIN_BYTES", 0);
 NCCL_PARAM(IbRecvCompletionDelayUs, "IB_RECV_COMPLETION_DELAY_US", 0);
 NCCL_PARAM(IbRecvCompletionDelayMinBytes, "IB_RECV_COMPLETION_DELAY_MIN_BYTES", 0);
+NCCL_PARAM(IbSendCompletionDelayUs, "IB_SEND_COMPLETION_DELAY_US", 0);
+NCCL_PARAM(IbSendCompletionDelayMinBytes, "IB_SEND_COMPLETION_DELAY_MIN_BYTES", 0);
 NCCL_PARAM(MeasureIterStart, "MEASURE_ITER_START", -1);
 NCCL_PARAM(MeasureIterEnd, "MEASURE_ITER_END", -1);
 NCCL_PARAM(CodepathTrace, "CODEPATH_TRACE", 0);
@@ -156,6 +158,7 @@ NCCL_PARAM(IbEceEnable,"IB_ECE_ENABLE",1);
 NCCL_PARAM(IbDataDirect,"IB_DATA_DIRECT",1);
 
 static std::atomic<uint64_t> ncclIbRecvCompletionDelayCount{0};
+static std::atomic<uint64_t> ncclIbSendCompletionDelayCount{0};
 static std::atomic<uint64_t> ncclIbMeasureSendSummaryCount{0};
 static std::atomic<uint64_t> ncclIbMeasureSendSummaryBytes{0};
 static std::atomic<uint64_t> ncclIbMeasureSendAvgPerSendCount{0};
@@ -505,6 +508,15 @@ static void ncclIbRecvCompletionDelaySummary() {
        (unsigned long long)ncclIbRecvCompletionDelayCount.load(std::memory_order_relaxed),
        (long long)ncclParamIbRecvCompletionDelayUs(),
        (long long)ncclParamIbRecvCompletionDelayMinBytes());
+}
+
+static void ncclIbSendCompletionDelaySummary() __attribute__((destructor));
+static void ncclIbSendCompletionDelaySummary() {
+  if (ncclParamIbSendCompletionDelayUs() <= 0) return;
+  INFO(NCCL_NET, "NET/IB: send completion delay summary delayed_requests=%llu delay_us=%lld min_bytes=%lld",
+       (unsigned long long)ncclIbSendCompletionDelayCount.load(std::memory_order_relaxed),
+       (long long)ncclParamIbSendCompletionDelayUs(),
+       (long long)ncclParamIbSendCompletionDelayMinBytes());
 }
 
 static void ncclIbMeasureSendSummary() __attribute__((destructor));
@@ -1499,6 +1511,7 @@ struct ncclIbRequest {
   uint64_t measureBytes;
   int measureIsolated;
   uint64_t recvCompletionObservedNs;
+  uint64_t sendCompletionObservedNs;
   union {
     struct {
       int size;
@@ -1629,6 +1642,23 @@ static inline bool ncclIbRecvCompletionVisible(struct ncclIbRequest* req) {
   uint64_t delayNs = (uint64_t)delayUs > UINT64_MAX / 1000
       ? UINT64_MAX : (uint64_t)delayUs * 1000;
   return nowNs - req->recvCompletionObservedNs >= delayNs;
+}
+
+static inline bool ncclIbSendCompletionVisible(struct ncclIbRequest* req) {
+  if (req->type != NCCL_NET_IB_REQ_SEND) return true;
+  int64_t delayUs = ncclParamIbSendCompletionDelayUs();
+  if (delayUs <= 0) return true;
+  int64_t minBytes = ncclParamIbSendCompletionDelayMinBytes();
+  if (minBytes > 0 && (uint64_t)req->send.size < (uint64_t)minBytes) return true;
+
+  uint64_t nowNs = ncclIbMeasureSendNowNs();
+  if (req->sendCompletionObservedNs == 0) {
+    req->sendCompletionObservedNs = nowNs;
+    ncclIbSendCompletionDelayCount.fetch_add(1, std::memory_order_relaxed);
+  }
+  uint64_t delayNs = (uint64_t)delayUs > UINT64_MAX / 1000
+      ? UINT64_MAX : (uint64_t)delayUs * 1000;
+  return nowNs - req->sendCompletionObservedNs >= delayNs;
 }
 
 static inline void ncclIbMeasureSendComplete(struct ncclIbRequest* req, const char* path) {
@@ -2493,6 +2523,7 @@ ncclResult_t ncclIbGetRequest(struct ncclIbNetCommBase* base, struct ncclIbReque
       memset(r->devBases, 0, sizeof(r->devBases));
       memset(r->events, 0, sizeof(r->events));
       r->recvCompletionObservedNs = 0;
+      r->sendCompletionObservedNs = 0;
       *req = r;
       return ncclSuccess;
     }
@@ -3115,6 +3146,7 @@ ncclResult_t ncclIbTest(void* request, int* done, int* sizes) {
   while (1) {
     NCCLCHECK(ncclIbStatsCheckFatalCount(&r->base->stats,__func__));
     if (ncclIbRequestDone(r)) {
+      if (!ncclIbSendCompletionVisible(r)) return ncclSuccess;
       if (!ncclIbRecvCompletionVisible(r)) return ncclSuccess;
       TRACE(NCCL_NET, "r=%p done", r);
       *done = 1;
@@ -3199,7 +3231,10 @@ ncclResult_t ncclIbTest(void* request, int* done, int* sizes) {
                 return ncclInternalError;
               }
               sendReq->events[i]--;
-              if (ncclIbRequestDone(sendReq)) ncclIbMeasureSendComplete(sendReq, "cq-isend");
+              if (ncclIbRequestDone(sendReq)) {
+                (void)ncclIbSendCompletionVisible(sendReq);
+                ncclIbMeasureSendComplete(sendReq, "cq-isend");
+              }
 #ifdef NCCL_ENABLE_NET_PROFILING
               // Stop Qp event for sendReq
               int qpIndex = getReqQpIndex(sendReq, j, wc->qp_num);
