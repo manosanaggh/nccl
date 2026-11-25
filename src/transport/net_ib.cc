@@ -77,6 +77,8 @@ const char* ibProviderName[] = {
 static int ncclNIbDevs = -1;
 struct alignas(64) ncclIbDev {
   std::mutex mutex;
+  std::mutex txPacingMutex;
+  uint64_t txPacingNextNs = 0;
   int device;
   uint64_t guid;
   uint8_t portNum;
@@ -140,6 +142,7 @@ NCCL_PARAM(IbMeasureSendKernelOverlap, "IB_MEASURE_SEND_KERNEL_OVERLAP", 0);
 NCCL_PARAM(IbMeasureSendKernelOverlapCallbacks, "IB_MEASURE_SEND_KERNEL_OVERLAP_CALLBACKS", 0);
 NCCL_PARAM(IbSendPostDelayUs, "IB_SEND_POST_DELAY_US", 0);
 NCCL_PARAM(IbSendPostDelayMinBytes, "IB_SEND_POST_DELAY_MIN_BYTES", 0);
+NCCL_PARAM(IbTxRateLimitMBps, "IB_TX_RATE_LIMIT_MBPS", 0);
 NCCL_PARAM(IbRecvCompletionDelayUs, "IB_RECV_COMPLETION_DELAY_US", 0);
 NCCL_PARAM(IbRecvCompletionDelayMinBytes, "IB_RECV_COMPLETION_DELAY_MIN_BYTES", 0);
 NCCL_PARAM(IbSendCompletionDelayUs, "IB_SEND_COMPLETION_DELAY_US", 0);
@@ -2845,6 +2848,13 @@ ncclResult_t ncclIbIsend(void* sendComm, void* data, size_t size, int tag, void*
   }
   NCCLCHECK(ncclIbStatsCheckFatalCount(&comm->base.stats,__func__));
 
+  const int64_t txRateMBps = ncclParamIbTxRateLimitMBps();
+  if (txRateMBps > 0 && comm->base.vProps.ndevs != 1) {
+    *request = NULL;
+    WARN("NET/IB: NCCL_IB_TX_RATE_LIMIT_MBPS requires a single physical port per send communicator");
+    return ncclInvalidUsage;
+  }
+
   struct ncclIbMrHandle* mhandleWrapper = (struct ncclIbMrHandle*) mhandle;
 
   // Wait for the receiver to have posted the corresponding receive
@@ -2872,6 +2882,34 @@ ncclResult_t ncclIbIsend(void* sendComm, void* data, size_t size, int tag, void*
       WARN("NET/IB : req %d/%d tag %x peer %s posted incorrect receive info: size %ld addr %lx rkeys[0]=%x",
         r, nreqs, tag, ncclSocketToString(&addr, line), slots[r].size, slots[r].addr, slots[r].rkeys[0]);
       return ncclInternalError;
+    }
+
+    ncclIbDev* pacingDev = nullptr;
+    uint64_t pacingNs = 0;
+    std::unique_lock<std::mutex> pacingLock;
+    if (txRateMBps > 0) {
+      uint64_t bytes = size;
+      bool lastMatch = true;
+      for (int i = 0; i < nreqs; i++) {
+        if (i == r) continue;
+        if (reqs[i] == nullptr) {
+          lastMatch = false;
+          break;
+        }
+        bytes += reqs[i]->send.size;
+      }
+      if (lastMatch && bytes != 0) {
+        // Retry only the last match, leaving the FIFO and its other requests intact.
+        pacingDev = &ncclIbDevs[comm->devs[0].base.ibDevN];
+        pacingLock = std::unique_lock<std::mutex>(pacingDev->txPacingMutex, std::try_to_lock);
+        if (!pacingLock.owns_lock() || ncclIbMeasureSendNowNs() < pacingDev->txPacingNextNs) {
+          *request = NULL;
+          return ncclSuccess;
+        }
+        // Decimal MB/s: 1 MB/s is one byte per 1000 ns.
+        const uint64_t scaledBytes = bytes * 1000;
+        pacingNs = scaledBytes / txRateMBps + (scaledBytes % txRateMBps != 0);
+      }
     }
 
     struct ncclIbRequest* req;
@@ -2931,6 +2969,7 @@ ncclResult_t ncclIbIsend(void* sendComm, void* data, size_t size, int tag, void*
 
     TIME_START(0);
     NCCLCHECK(ncclIbMultiSend(comm, slot));
+    if (pacingDev != nullptr) pacingDev->txPacingNextNs = ncclIbMeasureSendNowNs() + pacingNs;
 
     // Clear slots[0]->nreqs, as well as other fields to help debugging and sanity checks
     memset((void*)slots, 0, sizeof(struct ncclIbSendFifo));
